@@ -1,0 +1,34 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hurricane Tracker",
+        "description": "Track Atlantic & Pacific hurricanes (NHC data). Set your home location and options.",
+        "data": {
+          "location": "Home location",
+          "basin": "Basin",
+          "units": "Units",
+          "off_season": "When no storms are active",
+          "storm_filter": "Which storms to show"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Hurricane Tracker is already set up."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Hurricane Tracker options",
+        "data": {
+          "location": "Home location",
+          "basin": "Basin",
+          "units": "Units",
+          "off_season": "When no storms are active",
+          "storm_filter": "Which storms to show"
+        }
+      }
+    }
+  }
+}

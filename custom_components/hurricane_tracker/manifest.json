@@ -1,0 +1,13 @@
+{
+  "domain": "hurricane_tracker",
+  "name": "Hurricane Tracker",
+  "codeowners": ["@aaronmayeux"],
+  "config_flow": true,
+  "dependencies": ["http", "websocket_api", "frontend"],
+  "documentation": "https://github.com/aaronmayeux/ha-hurricane-tracker",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/aaronmayeux/ha-hurricane-tracker/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
