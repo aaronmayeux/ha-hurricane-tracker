@@ -15,6 +15,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.loader import async_get_integration
 
 from .const import CARD_FILENAME, DOMAIN, FRONTEND_URL_BASE
 from .coordinator import HurricaneCoordinator
@@ -25,6 +26,13 @@ _CARD_URL = f"{FRONTEND_URL_BASE}/{CARD_FILENAME}"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    # Register the card + websocket FIRST, before the (network) first refresh.
+    # If NHC is down at setup time the refresh raises ConfigEntryNotReady and HA
+    # retries later -- but the card must still load so the dashboard resolves
+    # `custom:hurricane-card` instead of erroring. Both are idempotent.
+    await _async_register_frontend(hass)
+    _register_ws(hass)
+
     coordinator = HurricaneCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
 
@@ -32,9 +40,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_reload_on_change))
-
-    await _async_register_frontend(hass)
-    _register_ws(hass)
     return True
 
 
@@ -61,8 +66,11 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
         StaticPathConfig(FRONTEND_URL_BASE, card_dir, cache_headers=False)
     ])
     # add_extra_js_url loads the card as a module on every dashboard, so it
-    # appears in the card picker with no manual resource step.
-    frontend.add_extra_js_url(hass, _CARD_URL)
+    # appears in the card picker with no manual resource step. The ?v= is the
+    # manifest version -- it forces browsers to fetch fresh JS after every
+    # release instead of serving a stale cached card.
+    integration = await async_get_integration(hass, DOMAIN)
+    frontend.add_extra_js_url(hass, f"{_CARD_URL}?v={integration.version}")
 
 
 # ---------------------------------------------------------------------------

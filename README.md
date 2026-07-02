@@ -62,13 +62,32 @@ All of these are editable later via the integration's **Configure** button.
 
 ## Adding the card
 
-The card auto-loads, so you usually just add it to a dashboard:
+Once the integration is set up, the card loads automatically — you don't add a
+dashboard resource by hand. Add it to any dashboard:
 
 ```yaml
 type: custom:hurricane-card
 ```
 
-It needs no configuration of its own — everything comes from the integration.
+Or pick **Hurricane Tracker** from the card picker. It needs no configuration of
+its own — everything comes from the integration.
+
+## Troubleshooting
+
+**"Custom element doesn't exist: hurricane-card"** means the card's JavaScript
+hasn't loaded in your browser yet. The card only loads *after* the integration
+itself is set up, in this order:
+
+1. Add the integration under **Settings → Devices & Services → Add Integration**
+   (downloading it in HACS is not enough — the integration has to be added here).
+2. **Restart Home Assistant** if you haven't since installing.
+3. **Hard-refresh your browser** (Ctrl/Cmd+Shift+R), or fully close and reopen the
+   app — the browser caches the old dashboard and won't see the card until you do.
+
+If you've done all three and still see the error, open
+**Settings → System → Logs**, search for `hurricane_tracker`, and
+[file an issue](https://github.com/aaronmayeux/ha-hurricane-tracker/issues) with
+what you find.
 
 ## How storm selection works
 
