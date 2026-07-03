@@ -3,10 +3,11 @@
     "step": {
       "user": {
         "title": "Hurricane Tracker",
-        "description": "Track Atlantic & Pacific hurricanes (NHC data). Set your home location and options.",
+        "description": "Track tropical cyclones worldwide (NHC for the Atlantic & Pacific, GDACS elsewhere). Set your home location and options.",
         "data": {
           "location": "Home location",
-          "basin": "Basin",
+          "basin": "Storms to show",
+          "range": "Range for \u201cwithin range\u201d (in your chosen units)",
           "units": "Units",
           "off_season": "When no storms are active",
           "storm_filter": "Which storms to show"
@@ -23,7 +24,8 @@
         "title": "Hurricane Tracker options",
         "data": {
           "location": "Home location",
-          "basin": "Basin",
+          "basin": "Storms to show",
+          "range": "Range for \u201cwithin range\u201d (in your chosen units)",
           "units": "Units",
           "off_season": "When no storms are active",
           "storm_filter": "Which storms to show"

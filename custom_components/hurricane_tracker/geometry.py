@@ -15,7 +15,7 @@ from .const import (
     BASIN_NAME,
     UNIT_KM,
 )
-from .nhc import basin_of, compass, haversine_mi
+from .nhc import compass, haversine_mi, storm_basin
 from .regions import REGION_LABELS
 
 _BASEMAP_PATH = os.path.join(os.path.dirname(__file__), "basemap.bin")
@@ -236,7 +236,7 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     ew_val = _dist_conv(ew_mi)
     ns_val = _dist_conv(ns_mi)
 
-    bkey = basin_of(storm.get("id"))
+    bkey = storm_basin(storm)
     meta = {
         "name": fdata.get("name") or storm.get("name", ""),
         "type": fdata.get("type") or storm.get("classification", ""),

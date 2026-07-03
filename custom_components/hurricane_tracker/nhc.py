@@ -20,10 +20,16 @@ import zipfile
 from .const import (
     BASIN_ATLANTIC,
     BASIN_AUTO,
+    BASIN_AUSTRALIAN,
     BASIN_CENTRAL_PACIFIC,
     BASIN_EAST_PACIFIC,
+    BASIN_GLOBAL,
+    BASIN_NORTH_INDIAN,
+    BASIN_NW_PACIFIC,
     BASIN_PREFIX,
-    BASIN_RANK,
+    BASIN_RANGE,
+    BASIN_SOUTH_PACIFIC,
+    BASIN_SW_INDIAN,
     CURRENT_STORMS_URL,
     FILTER_ALL,
     HTTP_TIMEOUT,
@@ -137,21 +143,41 @@ def basin_of(storm_id):
     return BASIN_PREFIX.get((storm_id or "")[:2].lower())
 
 
-def derive_home_basin(lat, lon):
-    """Which NHC basin a home location most naturally belongs to.
+def basin_from_latlon(lat, lon):
+    """Bucket any position into a tropical-cyclone basin key. Used for the home
+    location and for GDACS storms (which don't carry an NHC id prefix). Coarse
+    by design — NHC storms are typed precisely from their id, not this."""
+    if lat is None or lon is None:
+        return None
+    if lon > 180:
+        lon -= 360
+    if lon < -180:
+        lon += 360
+    if lat >= 0:
+        if -180 <= lon < -140:
+            return BASIN_CENTRAL_PACIFIC
+        if -140 <= lon < -100:
+            return BASIN_EAST_PACIFIC
+        if -100 <= lon < 20:
+            return BASIN_ATLANTIC
+        if 20 <= lon < 100:
+            return BASIN_NORTH_INDIAN
+        if 100 <= lon <= 180:
+            return BASIN_NW_PACIFIC
+    else:
+        if 20 <= lon < 90:
+            return BASIN_SW_INDIAN
+        if 90 <= lon < 160:
+            return BASIN_AUSTRALIAN
+        if lon >= 160 or lon < -70:
+            return BASIN_SOUTH_PACIFIC
+    return None
 
-    Heuristic (auto default only; the user can override by picking a basin):
-      - far-west longitudes -> Central Pacific (Hawaii region)
-      - Pacific side of North/Central America -> East Pacific
-      - everything else (incl. the entire Gulf of Mexico and US East Coast) ->
-        Atlantic
-    """
-    if lon <= -140:
-        return BASIN_CENTRAL_PACIFIC
-    # Pacific coast of the Americas: roughly west of the continental divide.
-    if -140 < lon <= -104 and 14 <= lat <= 50:
-        return BASIN_EAST_PACIFIC
-    return BASIN_ATLANTIC
+
+def storm_basin(s):
+    """Basin for a storm dict: GDACS storms carry a precomputed 'basin'; NHC
+    storms derive it from their id prefix."""
+    return s.get("basin") or basin_of(s.get("id"))
 
 
 # ---------------------------------------------------------------------------
@@ -192,43 +218,41 @@ def _threat_key(s, home_lat, home_lon):
             _dist_to_home(s, home_lat, home_lon))
 
 
-def select_storms(storms, home_lat, home_lon, basin_cfg, filter_cfg):
+def select_storms(storms, home_lat, home_lon, basin_cfg, filter_cfg, range_mi=None):
     """Return an ordered list of storms to display.
 
-    - Explicit basin  -> hard filter to that basin (empty basin => []).
-    - Auto basin      -> prefer the home basin; if it has no storms, fall
-                         through to whichever other basin holds the closest
-                         storm ("next closest storm").
-    - filter == all   -> return the whole eligible set, ordered for cycling.
-    - filter == threat-> return a single storm (approaching, else closest).
+    Scope (basin_cfg):
+      - global           -> every active storm, anywhere.
+      - range            -> storms within range_mi of home.
+      - auto (my region) -> home basin only (quiet basin => nothing).
+      - explicit basin   -> that basin only.
+    filter_cfg:
+      - all              -> whole eligible set, ordered for cycling.
+      - threat           -> a single storm (approaching, else closest).
     """
     storms = [s for s in (storms or []) if s.get("id")]
     if not storms:
         return []
 
-    explicit = basin_cfg != BASIN_AUTO
-    if explicit:
-        eligible = [s for s in storms if basin_of(s["id"]) == basin_cfg]
-    else:
+    if basin_cfg == BASIN_GLOBAL:
         eligible = storms
+    elif basin_cfg == BASIN_RANGE:
+        cap = range_mi if range_mi else float("inf")
+        eligible = [s for s in storms
+                    if _dist_to_home(s, home_lat, home_lon) <= cap]
+    elif basin_cfg == BASIN_AUTO:
+        home_basin = basin_from_latlon(home_lat, home_lon)
+        eligible = ([s for s in storms if storm_basin(s) == home_basin]
+                    if home_basin else [])
+    else:
+        eligible = [s for s in storms if storm_basin(s) == basin_cfg]
 
     if not eligible:
         return []
 
     ordered = sorted(eligible, key=lambda s: _threat_key(s, home_lat, home_lon))
-
     if filter_cfg == FILTER_ALL:
         return ordered
-
-    # THREAT (single storm).
-    if explicit:
-        return [ordered[0]]
-
-    # AUTO: home basin wins if it has any storm; otherwise the globally closest.
-    home_basin = derive_home_basin(home_lat, home_lon)
-    home_pool = [s for s in ordered if basin_of(s["id"]) == home_basin]
-    if home_pool:
-        return [home_pool[0]]
     return [ordered[0]]
 
 

@@ -38,7 +38,7 @@ class HurricaneSensor(CoordinatorEntity[HurricaneCoordinator], SensorEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name="Hurricane Tracker",
-            manufacturer="NHC / NOAA",
+            manufacturer="NHC/NOAA + GDACS (JRC)",
             entry_type=None,
         )
 

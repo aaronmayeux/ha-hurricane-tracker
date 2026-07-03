@@ -1,8 +1,8 @@
 """Config + options flow for Hurricane Tracker.
 
 Single instance. Setup collects: home location (map picker, defaults to this
-HA's configured location), basin, units, off-season display, and storm filter.
-All of it is editable later through the options flow.
+HA's configured location), scope/basin, range, units, off-season display, and
+storm filter. All of it is editable later through the options flow.
 """
 from __future__ import annotations
 
@@ -20,19 +20,28 @@ from homeassistant.util.unit_system import METRIC_SYSTEM
 
 from .const import (
     BASIN_ATLANTIC,
+    BASIN_AUSTRALIAN,
     BASIN_AUTO,
     BASIN_CENTRAL_PACIFIC,
     BASIN_EAST_PACIFIC,
+    BASIN_GLOBAL,
+    BASIN_NORTH_INDIAN,
+    BASIN_NW_PACIFIC,
+    BASIN_RANGE,
+    BASIN_SOUTH_PACIFIC,
+    BASIN_SW_INDIAN,
     CONF_BASIN,
     CONF_FILTER,
     CONF_LATITUDE,
     CONF_LOCATION,
     CONF_LONGITUDE,
     CONF_OFF_SEASON,
+    CONF_RANGE,
     CONF_UNITS,
     DEFAULT_BASIN,
     DEFAULT_FILTER,
     DEFAULT_OFF_SEASON,
+    DEFAULT_RANGE,
     DOMAIN,
     FILTER_ALL,
     FILTER_THREAT,
@@ -42,11 +51,19 @@ from .const import (
     UNIT_MI,
 )
 
+# The dropdown leads with three SCOPE modes, then explicit basins.
 _BASIN_OPTS = [
-    {"value": BASIN_AUTO, "label": "Auto (from home location)"},
+    {"value": BASIN_AUTO, "label": "My region (home basin only)"},
+    {"value": BASIN_RANGE, "label": "Within range of home"},
+    {"value": BASIN_GLOBAL, "label": "Anywhere in the world"},
     {"value": BASIN_ATLANTIC, "label": "Atlantic"},
     {"value": BASIN_EAST_PACIFIC, "label": "East Pacific"},
     {"value": BASIN_CENTRAL_PACIFIC, "label": "Central Pacific"},
+    {"value": BASIN_NW_PACIFIC, "label": "Northwest Pacific"},
+    {"value": BASIN_NORTH_INDIAN, "label": "North Indian"},
+    {"value": BASIN_SW_INDIAN, "label": "Southwest Indian"},
+    {"value": BASIN_AUSTRALIAN, "label": "Australian region"},
+    {"value": BASIN_SOUTH_PACIFIC, "label": "South Pacific"},
 ]
 _UNIT_OPTS = [
     {"value": UNIT_MI, "label": "Miles / mph"},
@@ -82,6 +99,13 @@ def _schema(hass, defaults: dict[str, Any]):
             selector.LocationSelector(),
         vol.Required(CONF_BASIN, default=defaults.get(CONF_BASIN, DEFAULT_BASIN)):
             _select(_BASIN_OPTS),
+        vol.Required(CONF_RANGE, default=defaults.get(CONF_RANGE, DEFAULT_RANGE)):
+            selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=100, max=6000, step=50,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
         vol.Required(CONF_UNITS, default=unit_default):
             _select(_UNIT_OPTS),
         vol.Required(CONF_OFF_SEASON,
