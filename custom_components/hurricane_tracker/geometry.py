@@ -1,9 +1,14 @@
 """Geometry: basemap reader, storm-framed bbox, clip, and payload assembly.
 
 Stdlib ONLY. The basemap is the compact packed file shipped with the
-integration (see tools/pack_basemap.py). This module reads it, clips it to a
-box around the storm, frames the view on the storm, converts units, and
-assembles the final draw-ready payload the card consumes.
+integration (built by tools/pack_basemap.py). It is GLOBAL and high-resolution,
+so it is read lazily: the packed bytes stay in memory, a light per-part bbox
+index is parsed up front, and only the parts inside the storm view are decoded
+on a clip. That keeps a global 10m map cheap enough for low-end hardware (a Pi).
+
+Per view, coastlines are simplified with Douglas-Peucker down to a point budget,
+so the payload the card draws stays bounded no matter how dense the region or how
+deep the zoom. The card smooths the budgeted points into curves at draw time.
 """
 from __future__ import annotations
 
@@ -26,95 +31,152 @@ _KT_TO_MPH = 1.15078
 _KT_TO_KMH = 1.852
 _MI_TO_KM = 1.609344
 
+# Per-view draw budget: total points across all basemap layers after
+# simplification. Keeps the websocket payload + SVG bounded at any zoom.
+_POINT_BUDGET = 12000
+_MIN_PTS = {"coast": 2, "states": 2, "land": 3}
+
 
 # ---------------------------------------------------------------------------
-# Basemap (packed binary) reader — matches tools/pack_basemap.py output
+# Basemap (packed binary) reader — HURB v2, matches tools/pack_basemap.py
 # ---------------------------------------------------------------------------
+class _Basemap:
+    """Lazy reader over the packed basemap. Holds the raw bytes plus a per-part
+    bbox index; decodes point coordinates only for parts a clip actually needs."""
+
+    def __init__(self, buf):
+        if buf[:4] != b"HURB":
+            raise ValueError("bad basemap magic")
+        ver, self.quant, nlayers = struct.unpack_from("<III", buf, 4)
+        if ver != 2:
+            raise ValueError("unsupported basemap version %d (need 2)" % ver)
+        self.buf = buf
+        p = 16
+        dirs = []
+        for _ in range(nlayers):
+            off, ln = struct.unpack_from("<II", buf, p)
+            p += 8
+            dirs.append((off, ln))
+        # index[layer] = list of (minx, miny, maxx, maxy, points_offset, npts)
+        self.index = {}
+        for name, (off, _ln) in zip(_LAYER_NAMES, dirs):
+            parts = []
+            cur = off
+            nparts = struct.unpack_from("<I", buf, cur)[0]
+            cur += 4
+            for _ in range(nparts):
+                mnx, mny, mxx, mxy = struct.unpack_from("<iiii", buf, cur)
+                cur += 16
+                npts = struct.unpack_from("<I", buf, cur)[0]
+                cur += 4
+                parts.append((mnx, mny, mxx, mxy, cur, npts))
+                cur += 8 * npts
+            self.index[name] = parts
+
+    def _decode(self, poff, npts):
+        q = self.quant
+        buf = self.buf
+        out = []
+        o = poff
+        for _ in range(npts):
+            xi, yi = struct.unpack_from("<ii", buf, o)
+            o += 8
+            out.append([xi / q, yi / q])
+        return out
+
+    def clip(self, layer, bbox, pad):
+        """Decode only the parts of `layer` whose stored bbox intersects the
+        padded view box. Returns a list of parts (each a list of [lng, lat])."""
+        q = self.quant
+        mnx = int((bbox[0] - pad) * q)
+        mny = int((bbox[1] - pad) * q)
+        mxx = int((bbox[2] + pad) * q)
+        mxy = int((bbox[3] + pad) * q)
+        out = []
+        for (a, b, c, d, poff, npts) in self.index.get(layer, []):
+            if a > mxx or c < mnx or b > mxy or d < mny:
+                continue
+            out.append(self._decode(poff, npts))
+        return out
+
+
 _basemap_cache = None
 
 
 def load_basemap(path=_BASEMAP_PATH):
-    """Read the packed basemap into {'coast':[...], 'states':[...], 'land':[...]}
-    where each layer is a list of parts, each part a list of [lng, lat]."""
+    """Read + index the packed basemap once (cached)."""
     global _basemap_cache
-    if _basemap_cache is not None:
-        return _basemap_cache
-    with open(path, "rb") as f:
-        buf = f.read()
-    if buf[:4] != b"HURB":
-        raise ValueError("bad basemap magic")
-    q = struct.unpack_from("<I", buf, 4)[0]
-    nlayers = struct.unpack_from("<I", buf, 8)[0]
-    p = 12
-    dirs = []
-    for _ in range(nlayers):
-        off, ln = struct.unpack_from("<II", buf, p)
-        p += 8
-        dirs.append((off, ln))
-    out = {}
-    for name, (off, _ln) in zip(_LAYER_NAMES, dirs):
-        parts = []
-        pp = off
-        nparts = struct.unpack_from("<I", buf, pp)[0]
-        pp += 4
-        for _ in range(nparts):
-            npts = struct.unpack_from("<I", buf, pp)[0]
-            pp += 4
-            coords = []
-            for _ in range(npts):
-                xi, yi = struct.unpack_from("<ii", buf, pp)
-                pp += 8
-                coords.append([xi / q, yi / q])
-            parts.append(coords)
-        out[name] = parts
-    _basemap_cache = out
-    return out
+    if _basemap_cache is None:
+        with open(path, "rb") as f:
+            _basemap_cache = _Basemap(f.read())
+    return _basemap_cache
 
 
 # ---------------------------------------------------------------------------
-# Clipping helpers
+# Douglas-Peucker simplification (per view)
 # ---------------------------------------------------------------------------
-def _seg_in_box(coords, box, pad):
-    min_lng, min_lat, max_lng, max_lat = box
-    for x, y in coords:
-        if (min_lng - pad) <= x <= (max_lng + pad) and (min_lat - pad) <= y <= (max_lat + pad):
-            return True
-    return False
-
-
-def _decimate(coords, step):
-    if step <= 1 or len(coords) <= 2:
-        return coords
-    out = coords[::step]
-    if out[-1] != coords[-1]:
-        out.append(coords[-1])
-    return out
+def _dp(pts, tol):
+    if tol <= 0 or len(pts) < 3:
+        return pts
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        a, b = stack.pop()
+        ax, ay = pts[a]
+        bx, by = pts[b]
+        dx, dy = bx - ax, by - ay
+        dd = dx * dx + dy * dy
+        idx, far = -1, tol
+        for i in range(a + 1, b):
+            px, py = pts[i]
+            if dd == 0:
+                dist = math.hypot(px - ax, py - ay)
+            else:
+                t = ((px - ax) * dx + (py - ay) * dy) / dd
+                if t < 0:
+                    t = 0.0
+                elif t > 1:
+                    t = 1.0
+                dist = math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+            if dist > far:
+                idx, far = i, dist
+        if idx != -1:
+            keep[idx] = True
+            stack.append((a, idx))
+            stack.append((idx, b))
+    return [pts[i] for i, k in enumerate(keep) if k]
 
 
 def clip_basemap(basemap, bbox, pad):
-    span = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-    if span <= 6:
-        step = 1
-    elif span <= 12:
-        step = 2
-    elif span <= 22:
-        step = 3
-    else:
-        step = 5
+    """Decode the in-view parts of each layer and simplify to the point budget.
+    Coastlines get finer detail when zoomed in and thin out when zoomed out; the
+    total point count is capped so the payload never blows up."""
+    raw = {name: basemap.clip(name, bbox, pad) for name in _LAYER_NAMES}
+    span = max(bbox[2] - bbox[0], bbox[3] - bbox[1], 0.01)
 
-    def clip(layer, min_pts):
-        out = []
-        for part in basemap.get(layer, []):
-            if len(part) < min_pts:
-                continue
-            if _seg_in_box(part, bbox, pad):
-                out.append([[round(x, 4), round(y, 4)] for x, y in _decimate(part, step)])
-        return out
+    # Start near screen resolution, then back off (coarser) until under budget.
+    tol = span / 700.0
+    for _ in range(7):
+        simplified = {}
+        total = 0
+        for name in _LAYER_NAMES:
+            minp = _MIN_PTS[name]
+            parts = []
+            for part in raw[name]:
+                s = _dp(part, tol)
+                if len(s) < minp:
+                    continue
+                parts.append(s)
+                total += len(s)
+            simplified[name] = parts
+        if total <= _POINT_BUDGET:
+            break
+        tol *= 1.7
 
     return {
-        "coast": clip("coast", 2),
-        "states": clip("states", 2),
-        "land": clip("land", 3),
+        name: [[[round(x, 4), round(y, 4)] for x, y in part] for part in simplified[name]]
+        for name in _LAYER_NAMES
     }
 
 
@@ -195,18 +257,6 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     dist_mi = (haversine_mi(home_lat, home_lon, cur_lat, cur_lng)
                if cur_lat is not None and cur_lng is not None else None)
 
-    # E/W and N/S components for the off-screen home edge marker on the card.
-    # E/W measured along home's parallel, N/S along home's meridian. dateline-safe.
-    ew_mi = ns_mi = None
-    ew_dir = ns_dir = None
-    if (cur_lat is not None and cur_lng is not None
-            and home_lat is not None and home_lon is not None):
-        dlon = ((cur_lng - home_lon + 180.0) % 360.0) - 180.0
-        ew_mi = haversine_mi(home_lat, home_lon, home_lat, home_lon + dlon)
-        ew_dir = "E" if dlon >= 0 else "W"
-        ns_mi = haversine_mi(home_lat, home_lon, cur_lat, home_lon)
-        ns_dir = "N" if cur_lat >= home_lat else "S"
-
     km = units == UNIT_KM
     wind_unit = "km/h" if km else "mph"
     dist_unit = "km" if km else "mi"
@@ -233,8 +283,6 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         return round(mi * _MI_TO_KM) if km else round(mi)
 
     dist_val = _dist_conv(dist_mi)
-    ew_val = _dist_conv(ew_mi)
-    ns_val = _dist_conv(ns_mi)
 
     bkey = storm_basin(storm)
     meta = {
@@ -246,10 +294,6 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "mslp": p0.get("mslp"),
         "moveText": move_text,
         "dist": dist_val,
-        "ew": ew_val,
-        "ewDir": ew_dir,
-        "ns": ns_val,
-        "nsDir": ns_dir,
         "distUnit": dist_unit,
         "windUnit": wind_unit,
         "basin": bkey,
