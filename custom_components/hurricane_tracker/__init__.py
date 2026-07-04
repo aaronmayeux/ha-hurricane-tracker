@@ -21,7 +21,7 @@ from .const import CARD_FILENAME, DOMAIN, FRONTEND_URL_BASE
 from .coordinator import HurricaneCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
 _CARD_URL = f"{FRONTEND_URL_BASE}/{CARD_FILENAME}"
 
 

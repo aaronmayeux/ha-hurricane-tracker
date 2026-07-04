@@ -22,6 +22,13 @@ from .const import (
 )
 from .geometry import assemble_payload
 
+# DEV-ONLY mock (real historical storm through the real path; see _dev_mock.py).
+# Not present in the release clone -> this import cleanly no-ops there.
+try:
+    from . import _dev_mock
+except Exception:  # pragma: no cover
+    _dev_mock = None
+
 _LOGGER = logging.getLogger(__name__)
 
 MAX_STORMS = 8  # cap baked systems in "show all" mode (peak season safety)
@@ -32,6 +39,11 @@ def _build(home_lat, home_lon, basin, units, storm_filter, range_mi=None):
     """Blocking pipeline: fetch (NHC + GDACS) -> merge/dedupe -> select -> bake.
     Returns the coordinator data dict. Runs inside an executor."""
     import json
+
+    if _dev_mock is not None and getattr(_dev_mock, "ENABLED", False):
+        mock = _dev_mock.build(home_lat, home_lon, units)
+        if mock:
+            return mock
 
     active = []
     # NHC: Atlantic + E/Central Pacific, native cone.

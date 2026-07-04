@@ -12,8 +12,10 @@ options are passed in.
 from __future__ import annotations
 
 import io
+import json
 import math
 import struct
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -35,6 +37,11 @@ from .const import (
     HTTP_TIMEOUT,
     PAST_MILES,
     USER_AGENT,
+    WIND_ADVISORY_OFFSET,
+    WIND_FORECAST_OFFSET,
+    WIND_RADII_URL,
+    WIND_SLOT_BLOCK,
+    WIND_SLOT_STEP,
 )
 
 _HEADERS = {"User-Agent": USER_AGENT}
@@ -427,6 +434,152 @@ def parse_besttrack(zb, cutoff_miles=PAST_MILES):
     return [[round(x, 4), round(y, 4)] for x, y in track]
 
 
+# ---------------------------------------------------------------------------
+# Forecast wind radii (Phase 3, NHC-only) -- CURRENT-position 34/50/64 kt field
+# ---------------------------------------------------------------------------
+# Pulled from the tropical MapServer's per-slot "Advisory Wind Field" layer, using
+# the per-quadrant radii fields (ne/se/sw/nw, nautical mi) -- NOT the polygon
+# geometry, so geometry.py can build a smooth organic ring instead of the raw
+# quadrant shape. Internal schema handed to geometry:
+#   [{"kt": 34, "ne": .., "se": .., "sw": .., "nw": ..}, ...]
+# UNVERIFIED live (no active NHC storm at build): everything soft-fails to [] so
+# a missing/blank field just falls back to center distance. Do NOT release until
+# proven against a real active storm.
+def _wind_layer_id(storm, offset=WIND_ADVISORY_OFFSET):
+    """MapServer layer id for a storm's wind-radii layer, from its bin. `offset`
+    picks which sibling layer: WIND_ADVISORY_OFFSET (current, Phase 3) or
+    WIND_FORECAST_OFFSET (per-tau forecast, Phase 4). e.g. AT1 -> 17 / 16.
+    None if the bin is missing/unrecognized."""
+    bn = (storm.get("binNumber") or "").upper().strip()
+    if len(bn) < 3:
+        return None
+    grp, num = bn[:2], bn[2:]
+    base = WIND_SLOT_BLOCK.get(grp)
+    try:
+        slot = int(num)
+    except ValueError:
+        return None
+    if base is None or not (1 <= slot <= 5):
+        return None
+    return base + (slot - 1) * WIND_SLOT_STEP + offset
+
+
+def parse_wind_field(data):
+    """ArcGIS query JSON -> internal wind-field schema: one dict per threshold
+      [{"kt": 34, "ne": .., "se": .., "sw": .., "nw": ..}, ...]  (radii in nm)
+    ascending kt, first feature per threshold wins. geometry.py turns each into a
+    smooth ring. Missing/negative radii clamp to 0."""
+    feats = (data or {}).get("features") or []
+    out, seen = [], set()
+    for ft in feats:
+        a = ft.get("attributes") or ft.get("properties") or {}
+
+        def g(key):
+            v = _num(a.get(key))
+            if v is None:
+                v = _num(a.get(key.upper()))
+            return v if (v and v > 0) else 0.0
+
+        kt = _num(a.get("radii"))
+        if kt is None:
+            kt = _num(a.get("RADII"))
+        if kt is None:
+            continue
+        kt = int(round(kt))
+        if kt not in (34, 50, 64) or kt in seen:
+            continue
+        seen.add(kt)
+        out.append({"kt": kt, "ne": g("ne"), "se": g("se"),
+                    "sw": g("sw"), "nw": g("nw")})
+    return sorted(out, key=lambda d: d["kt"])
+
+
+def fetch_wind_field(storm):
+    """Fetch + parse the current wind-radii field for one NHC storm. Blocking;
+    soft-fails to []."""
+    lid = _wind_layer_id(storm)
+    if lid is None:
+        return []
+    sid = (storm.get("id") or "").upper()
+    where = "stormid='%s'" % sid if sid else "1=1"
+    url = ("%s/%d/query?where=%s&outFields=radii,ne,se,sw,nw"
+           "&returnGeometry=false&f=json"
+           % (WIND_RADII_URL, lid, urllib.parse.quote(where)))
+    try:
+        return parse_wind_field(json.loads(http_get(url)))
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Forecast wind radii per tau (Phase 4, NHC-only) -- the at-home exposure timeline
+# ---------------------------------------------------------------------------
+# Same MapServer, the sibling "Forecast Wind Radii" layer (WIND_FORECAST_OFFSET),
+# which carries a `tau` field so we get the 34/50/64 kt radii at every forecast
+# time. Internal schema handed to geometry:
+#   [{"tau": 12.0, "radii": [{"kt": 34, "ne": .., "se": .., "sw": .., "nw": ..}, ...]}, ...]
+# Same UNVERIFIED-live / soft-fail rule as Phase 3: do NOT release until proven on
+# a real active storm.
+def parse_wind_forecast(data):
+    """ArcGIS query JSON -> per-tau forecast radii, ascending tau (ascending kt
+    within each tau):
+      [{"tau": T, "radii": [{"kt":34,"ne":..,"se":..,"sw":..,"nw":..}, ...]}, ...]
+    First feature per (tau, kt) wins; missing/negative radii clamp to 0; a tau (or
+    threshold) with no positive radii is dropped."""
+    feats = (data or {}).get("features") or []
+    bytau = {}
+    for ft in feats:
+        a = ft.get("attributes") or ft.get("properties") or {}
+
+        def g(key):
+            v = _num(a.get(key))
+            if v is None:
+                v = _num(a.get(key.upper()))
+            return v if (v and v > 0) else 0.0
+
+        tau = _num(a.get("tau"))
+        if tau is None:
+            tau = _num(a.get("TAU"))
+        kt = _num(a.get("radii"))
+        if kt is None:
+            kt = _num(a.get("RADII"))
+        if tau is None or kt is None:
+            continue
+        kt = int(round(kt))
+        if kt not in (34, 50, 64):
+            continue
+        slot = bytau.setdefault(float(tau), {})
+        if kt in slot:
+            continue
+        ne, se, sw, nw = g("ne"), g("se"), g("sw"), g("nw")
+        if max(ne, se, sw, nw) <= 0:
+            continue
+        slot[kt] = {"kt": kt, "ne": ne, "se": se, "sw": sw, "nw": nw}
+    out = []
+    for tau in sorted(bytau):
+        radii = [bytau[tau][kt] for kt in (34, 50, 64) if kt in bytau[tau]]
+        if radii:
+            out.append({"tau": tau, "radii": radii})
+    return out
+
+
+def fetch_wind_forecast(storm):
+    """Fetch + parse the per-tau forecast wind-radii field for one NHC storm.
+    Blocking; soft-fails to []."""
+    lid = _wind_layer_id(storm, WIND_FORECAST_OFFSET)
+    if lid is None:
+        return []
+    sid = (storm.get("id") or "").upper()
+    where = "stormid='%s'" % sid if sid else "1=1"
+    url = ("%s/%d/query?where=%s&outFields=radii,tau,ne,se,sw,nw"
+           "&returnGeometry=false&f=json"
+           % (WIND_RADII_URL, lid, urllib.parse.quote(where)))
+    try:
+        return parse_wind_forecast(json.loads(http_get(url)))
+    except Exception:
+        return []
+
+
 def fetch_storm_geometry(storm):
     """Fetch + parse one storm's forecast (and best-track) GIS. Blocking."""
     fz = _adv_zip_url(storm)
@@ -441,4 +594,15 @@ def fetch_storm_geometry(storm):
         except Exception:  # best-track is optional; soft-fail
             past = []
     fdata["pastTrack"] = past
+    # Current-position wind radii (NHC-only; soft-fails to []). UNVERIFIED live.
+    try:
+        fdata["windField"] = fetch_wind_field(storm)
+    except Exception:
+        fdata["windField"] = []
+    # Per-tau forecast wind radii for the at-home exposure timeline (Phase 4,
+    # NHC-only; soft-fails to []). UNVERIFIED live.
+    try:
+        fdata["windForecast"] = fetch_wind_forecast(storm)
+    except Exception:
+        fdata["windForecast"] = []
     return fdata

@@ -40,7 +40,7 @@ const COLOR_VARS = {
   background_color: "--hu-bg",
 };
 /* Layer toggles (default on). */
-const TOGGLES = ["show_land", "show_states", "show_coast", "show_labels", "show_scale", "show_home", "smooth"];
+const TOGGLES = ["show_land", "show_states", "show_coast", "show_labels", "show_scale", "show_home", "show_winds", "show_timeline", "smooth"];
 
 function catDotLabel(c) {
   const k = String(c || "").toUpperCase();
@@ -57,7 +57,41 @@ function catLabel(c) {
   if (/DEPRESS/.test(k)) return "TD";
   return "";
 }
+/* Wind-radii threshold (kt) -> plain-language force name. */
+function windForceName(kt) {
+  return kt === 64 ? "Hurricane force winds"
+       : kt === 50 ? "Storm force winds"
+       : "Tropical Storm force winds";
+}
+/* Short force name for the exposure-timeline rows. */
+function forceShort(kt) {
+  return kt === 64 ? "Hurricane force" : kt === 50 ? "Storm force" : "Tropical-storm force";
+}
 const withCommas = (n) => (n == null ? "" : Number(n).toLocaleString("en-US"));
+/* Relative ETA from a forecast hour (tau). Relative, not wall-clock: tau is hours
+ * from the advisory synoptic time (~now), so "~" signals the inherent slop. */
+function fmtEta(h) {
+  if (h == null) return "";
+  if (h < 1) return "now";
+  if (h < 36) return `~${Math.round(h)} h`;
+  const r = Math.round((h / 24) * 2) / 2;   // nearest half-day
+  return `~${r} day${r === 1 ? "" : "s"}`;
+}
+/* Forecast hour (tau) -> wall-clock day+time from an absolute reference (epoch ms,
+ * UTC to match the on-map dot labels). No reference -> relative hours. Rounded to
+ * the hour; the "possible" framing covers the slop. */
+function fmtClock(refTime, tau) {
+  if (refTime == null) {
+    const h = Math.round(tau);
+    return h < 1 ? "now" : `~${h} h`;
+  }
+  const d = new Date(refTime + Math.round(tau) * 3600 * 1000);
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  let h = d.getUTCHours();
+  const ap = h < 12 ? "AM" : "PM";
+  h = h % 12; if (h === 0) h = 12;
+  return `${days[d.getUTCDay()]} ${h} ${ap}`;
+}
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -158,9 +192,10 @@ function houseGlyph(cx, cy) {
   return `<g class="hu-home" transform="translate(${(cx - 12 * S).toFixed(2)},${(cy - 12 * S).toFixed(2)}) scale(${S})"><path d="${MDI_HOME_PATH}"/></g>`;
 }
 
-/* Off-screen home: clamp the house near the viewport edge and draw a chevron on
- * the inboard (storm) side, pointing outward through the house center along the
- * true storm->home line. Total home distance labeled further inboard. */
+/* Off-screen home: clamp the house to the viewport edge at home's projected spot
+ * and draw a chevron along the house-center -> home line, pointing outward toward
+ * home. Direction is derived from the clamped position every time, so it aims
+ * correctly from any edge or corner. Distance labeled further inboard. */
 const EDGE_M = 50;
 function homeEdgeMarker(hx, hy, m) {
   const cx = Math.max(EDGE_M, Math.min(VBW - EDGE_M, hx));
@@ -304,6 +339,20 @@ function buildConeSvg(st, cfg) {
     for (const part of (st.geo && st.geo.coast) || [])
       if (part.length >= 2) base.push(`<path class="hu-coast" d="${basePath(proj, part, false, smooth)}"/>`);
 
+  // Phase 3 wind field: nested semi-transparent fills (34/50/64 kt), theme text
+  // color, no outline/legend. Overlap stacks alpha so the core reads brighter.
+  // Drawn UNDER the cone/tracks/dots. Handles 0-3 thresholds. The radii are
+  // per-quadrant (NE/SE/SW/NW) so the raw polygon has hard corners at the quadrant
+  // lines; we run it through the same Catmull-Rom smoother as the coastlines to
+  // round those into organic curves. This keeps the lopsided extents intact --
+  // smoothing, not circularizing.
+  const windLayer = [];
+  if (cfg.show_winds !== false && st.windField && st.windField.length)
+    for (const w of st.windField)
+      for (const ring of (w.rings || []))
+        if (ring.length >= 3)
+          windLayer.push(`<path class="hu-wind" d="${basePath(proj, ring, true, smooth)}"/>`);
+
   const storm = [];
   for (const seg of st.ww || []) {
     const col = wwColor(seg.type);
@@ -342,15 +391,35 @@ function buildConeSvg(st, cfg) {
   const homeParts = [];
   let farCase = false, hcx = 0, hcy = 0;
   if (cfg.show_home !== false && st.home && st.home[0] != null) {
-    const [hx, hy] = proj(st.home[0], st.home[1]);
+    // Normalize home longitude into the map's 360-degree window so a home more than
+    // half the globe away in raw longitude still projects to the correct side (short
+    // way round), not the wrong edge. Then project it like everything else -- the
+    // marker sits where home actually is on THIS map, and the chevron aims at it.
+    const cLng = (st.bbox[0] + st.bbox[2]) / 2;
+    let hlng = st.home[0];
+    while (hlng - cLng > 180) hlng -= 360;
+    while (hlng - cLng < -180) hlng += 360;
+    const [hx, hy] = proj(hlng, st.home[1]);
     if (hx >= 0 && hx <= VBW && hy >= 0 && hy <= VBH) {
       homeParts.push(houseGlyph(hx, hy));
       keepOut.push({ x1: hx - 20, y1: hy - 20, x2: hx + 20, y2: hy + 20 });
     } else {
+      // Off-frame: clamp the house to the edge at home's projected position; the
+      // chevron points from the house center straight at home.
       homeParts.push(homeEdgeMarker(hx, hy, st.meta || {}));
       hcx = Math.max(EDGE_M, Math.min(VBW - EDGE_M, hx));
       hcy = Math.max(EDGE_M, Math.min(VBH - EDGE_M, hy));
-      keepOut.push({ x1: hcx - 74, y1: hcy - 74, x2: hcx + 74, y2: hcy + 74 });
+      // keep-out AABB covering the whole marker (house + chevron + distance label)
+      // so region labels and the scale avoid it -- collision rules apply to it too.
+      let ux = hx - hcx, uy = hy - hcy;
+      const ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
+      const inX = hcx - ux * 160, inY = hcy - uy * 160;   // inboard (label) reach
+      const outX = hcx + ux * 34, outY = hcy + uy * 34;   // outboard (arrow) reach
+      const P = 22;
+      keepOut.push({
+        x1: Math.min(inX, outX, hcx) - P, y1: Math.min(inY, outY, hcy) - P,
+        x2: Math.max(inX, outX, hcx) + P, y2: Math.max(inY, outY, hcy) + P,
+      });
       farCase = true;
     }
   }
@@ -359,7 +428,7 @@ function buildConeSvg(st, cfg) {
   const region = cfg.show_labels !== false ? regionLabels(st.labels, proj, st.bbox, keepOut, conePx) : [];
   const scale = (farCase && cfg.show_scale !== false) ? scaleAxes(st.bbox, proj, st.geo, keepOut, conePx, hcx, hcy) : [];
 
-  const layers = [...base, ...region, ...scale, ...storm, ...homeParts];
+  const layers = [...base, ...windLayer, ...region, ...scale, ...storm, ...homeParts];
   return `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">${layers.join("")}</svg>`;
 }
 
@@ -372,10 +441,125 @@ function dataBar(st) {
   if (m.type) bits.push(m.type);
   if (m.wind != null) { let s = `${m.wind} ${m.windUnit}`; if (m.gust != null) s += ` (gust ${m.gust})`; bits.push(s); }
   if (m.moveText) bits.push(m.moveText);
-  if (m.dist != null) bits.push(`${withCommas(m.dist)} ${m.distUnit} from home`);
+  // Distance line + closest approach, kept on ONE basis so "closest" can't read
+  // farther than "now": with a wind field both are wind-EDGE distances, else both
+  // are eye distances (geometry shifts cpaDist to match). curShown is whatever the
+  // current-distance line shows; null when winds are already at home.
+  let curShown = null, distLine = null;
+  if (m.hasWind && m.windAtHome != null) {
+    distLine = `${windForceName(m.windAtHome)} at home`;
+  } else if (m.hasWind && m.windDist != null) {
+    if (m.windDist <= 0) {                      // rounds to 0 -> home is at/inside the edge, not "0 mi from"
+      distLine = `${windForceName(34)} at home`;
+    } else {
+      curShown = m.windDist;
+      distLine = `${withCommas(curShown)} ${m.distUnit} from Tropical Storm force winds`;
+    }
+  } else if (m.dist != null) {
+    curShown = m.dist;
+    distLine = `${withCommas(curShown)} ${m.distUnit} from home`;
+  }
+  if (distLine) bits.push(distLine);
+  if (curShown != null && m.cpaDist != null) {
+    if (m.cpaDist < curShown) {                 // forecast to get closer than it is now
+      let s = `closest ~${withCommas(m.cpaDist)} ${m.distUnit}`;
+      const eta = fmtEta(m.cpaHours);
+      if (eta && eta !== "now") s += ` in ${eta}`;
+      bits.push(s);
+    } else {
+      bits.push("moving away");                  // closest point is now/behind -- receding
+    }
+  }
   let peak = "";
   if (m.peak && m.peak.word) peak = `<div class="hu-bar-peak">Peak ${esc(m.peak.word)}${m.peak.label ? " by " + esc(m.peak.label) : ""}</div>`;
   return `<div class="hu-bar-name">${esc(name)}</div><div class="hu-bar-data">${esc(bits.join(" \u00b7 "))}</div>${peak}`;
+}
+
+/* Phase 4: the at-home wind timeline -- a compact, self-contained graph UNDER the
+ * map (its own zone, never on the map). A titled wind bar whose opacity deepens
+ * where stronger thresholds overlap (same nested-alpha language as the on-map
+ * wash); the home glyph on the bar at the storm centre's closest pass with the
+ * distance tagged above it; and day/time labels INLINE at the real wind start/stop
+ * points (weekday shown only when it changes, thinned to avoid collision, ends
+ * always kept). Returns "" (renders nothing) unless home is forecast into a field. */
+function exposureTimeline(st, cfg) {
+  if (cfg.show_timeline === false) return "";
+  const ex = st.meta && st.meta.exposure;
+  if (!ex || !ex.rows || !ex.rows.length) return "";        // hidden when no data
+  const ref = ex.refTime != null ? ex.refTime : null;
+  const unit = (st.meta && st.meta.distUnit) || "mi";
+  const OP = { 34: 0.16, 50: 0.30, 64: 0.46 };
+
+  // Axis spans exactly the data: earliest wind start -> latest wind stop, widened
+  // to include the closest-pass time if it falls outside. No fixed hour grid.
+  const bounds = [];
+  for (const r of ex.rows) for (const [a, b] of r.windows) bounds.push(a, b);
+  const cpa = ex.cpa && ex.cpa.tau != null ? ex.cpa : null;
+  const lo = 0;                                             // graph always starts at "now"
+  let hi = Math.max.apply(null, bounds);
+  if (cpa) hi = Math.max(hi, cpa.tau);
+  if (hi - lo < 0.5) hi = lo + 0.5;
+  const pct = (t) => ((Math.max(lo, Math.min(hi, t)) - lo) / (hi - lo)) * 100;
+  const anchor = (x) => (x < 12 ? "translateX(0)" : x > 88 ? "translateX(-100%)" : "translateX(-50%)");
+
+  // wind bar: stronger thresholds stacked on top -> darker where they overlap
+  let bars = "";
+  for (const r of ex.rows) for (const [a, b] of r.windows) {
+    const l = pct(a), w = Math.max(1.5, pct(b) - l);
+    bars += `<span class="hu-tl-win" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%;opacity:${OP[r.kt] || 0.16}"></span>`;
+  }
+
+  // closest-pass marker = the same home glyph the map uses, on the bar; distance
+  // tagged just above it
+  let home = "", tag = "";
+  if (cpa) {
+    const x = pct(cpa.tau);
+    home = `<span class="hu-tl-home" style="left:${x.toFixed(2)}%"><svg viewBox="0 0 24 24"><path d="${MDI_HOME_PATH}"/></svg></span>`;
+    if (cpa.dist != null)
+      tag = `<span class="hu-tl-tag" style="left:${x.toFixed(2)}%;transform:${anchor(x)}">${esc(withCommas(cpa.dist) + " " + unit)}</span>`;
+  }
+
+  // day/time labels at the real wind start/stop points, INLINE (one row): weekday
+  // shown only when it changes, then thinned so nothing collides (ends always kept)
+  const seen = {}, blist = [];
+  for (const t of bounds) { const k = Math.round(t); if (!(k in seen)) { seen[k] = 1; blist.push(t); } }
+  blist.sort((a, b) => a - b);
+  let prevDay = null;
+  const items = [{ x: 0, label: "now" }];                   // left edge is always "now"
+  for (const t of blist) {
+    const full = ref != null ? fmtClock(ref, t) : `~${Math.round(t)}h`;
+    let label = full;
+    if (ref != null) {
+      const sp = full.indexOf(" ");
+      const day = sp > 0 ? full.slice(0, sp) : full;
+      if (day === prevDay) label = full.slice(sp + 1);      // drop repeated weekday
+      prevDay = day;
+    }
+    items.push({ x: pct(t), label });
+  }
+  const n = items.length;
+  const wpc = (it) => (it.label.length * 6.2 / 330) * 100;   // est width %, worst-case phone
+  const leftOf = (it) => it.x < 12 ? it.x : it.x > 88 ? it.x - wpc(it) : it.x - wpc(it) / 2;
+  const keep = new Set([0, n - 1]);
+  let lastRight = leftOf(items[0]) + wpc(items[0]);
+  const lastLeft = leftOf(items[n - 1]);
+  for (let i = 1; i < n - 1; i++) {
+    const l = leftOf(items[i]);
+    if (l > lastRight + 1 && l + wpc(items[i]) < lastLeft - 1) { keep.add(i); lastRight = l + wpc(items[i]); }
+  }
+  let times = "";
+  items.forEach((it, i) => {
+    if (!keep.has(i)) return;
+    times += `<span class="hu-tl-tick" style="left:${it.x.toFixed(2)}%"></span>`;
+    times += `<span class="hu-tl-time" style="left:${it.x.toFixed(2)}%;transform:${anchor(it.x)}">${esc(it.label)}</span>`;
+  });
+
+  return `<div class="hu-tl">
+    <div class="hu-tl-title">Storm force winds at home / Closest to eye</div>
+    <div class="hu-tl-tagrow">${tag}</div>
+    <div class="hu-tl-track">${bars}${home}</div>
+    <div class="hu-tl-times">${times}</div>
+  </div>`;
 }
 
 const STYLE = `
@@ -394,6 +578,7 @@ const STYLE = `
   .hu-scale-tick { stroke: var(--secondary-text-color); stroke-width: 1.5; opacity: .55; }
   .hu-scale-label { font: 600 11px/1 sans-serif; fill: var(--secondary-text-color); opacity: .7;
                     paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
+  .hu-wind { fill: var(--primary-text-color); fill-opacity: .13; stroke: none; }
   .hu-ww { fill: none; stroke-width: 4; stroke-linecap: round; }
   .hu-cone-poly { fill: var(--hu-cone-color, var(--primary-text-color)); fill-opacity: .08; stroke: var(--hu-cone-color, var(--primary-text-color)); stroke-opacity: .3; stroke-width: 1; }
   .hu-track-past { fill: none; stroke: var(--hu-track-past-color, var(--secondary-text-color)); stroke-width: 2; stroke-dasharray: 4 5; opacity: .6; }
@@ -410,6 +595,20 @@ const STYLE = `
   .hu-bar-name { font-size: 20px; font-weight: 700; color: var(--primary-text-color); }
   .hu-bar-data { font-size: 14px; color: var(--secondary-text-color); margin-top: 2px; }
   .hu-bar-peak { font-size: 13px; color: var(--secondary-text-color); margin-top: 4px; opacity: .9; }
+  .hu-tl { padding: 8px 14px 10px; }
+  .hu-tl-title { font-size: 12px; font-weight: 700; letter-spacing: .02em; color: var(--primary-text-color); opacity: .9; margin-bottom: 6px; }
+  .hu-tl-tagrow { position: relative; height: 15px; }
+  .hu-tl-tag { position: absolute; bottom: 0; white-space: nowrap; font: 600 11px/1 sans-serif; color: var(--secondary-text-color); }
+  .hu-tl-track { position: relative; height: 16px; border-radius: 3px;
+                 background: var(--divider-color, rgba(127,127,127,.2)); }
+  .hu-tl-win { position: absolute; top: 0; height: 100%; border-radius: 3px; background: var(--primary-text-color); }
+  .hu-tl-home { position: absolute; top: 50%; width: 18px; height: 18px; transform: translate(-50%, -50%); }
+  .hu-tl-home svg { width: 100%; height: 100%; display: block; }
+  .hu-tl-home path { fill: #fff; stroke: rgba(0,0,0,.55); stroke-width: 1.5; paint-order: stroke; }
+  .hu-tl-times { position: relative; height: 20px; margin-top: 4px; }
+  .hu-tl-tick { position: absolute; top: 0; width: 1px; height: 5px; transform: translateX(-50%);
+                background: var(--secondary-text-color); opacity: .5; }
+  .hu-tl-time { position: absolute; top: 7px; white-space: nowrap; font: 400 11px/1 sans-serif; color: var(--secondary-text-color); }
   .hu-msg { padding: 28px 18px; text-align: center; color: var(--secondary-text-color); }
   .hu-msg .hu-msg-icon { --mdc-icon-size: 40px; color: var(--secondary-text-color); opacity: .7; }
   .hu-msg .hu-msg-icon.hu-spin { animation: hu-spin 1.4s linear infinite; transform-origin: center; }
@@ -499,7 +698,7 @@ class HurricaneCard extends HTMLElement {
       catch (e) { svg = this._msg("mdi:map-marker-alert", "Couldn\u2019t draw this storm", "", false); }
       body = `<div class="hu-tag">${esc(tagName)}</div>
         <div class="hu-conewrap">${svg}</div>
-        <div class="hu-bar">${dataBar(st)}</div>${pager}${stale}`;
+        <div class="hu-bar">${dataBar(st)}</div>${exposureTimeline(st, cfg)}${pager}${stale}`;
     } else if (d.reason === "none_matched") {
       const n = d.activeAnywhere || 0;
       body = this._msg("mdi:map-marker-off", "No storms near you",
@@ -534,6 +733,8 @@ const EDITOR_FIELDS = [
   { key: "show_labels", label: "Show region labels", type: "bool", def: true },
   { key: "show_scale", label: "Show offshore mileage scale", type: "bool", def: true },
   { key: "show_home", label: "Show home marker", type: "bool", def: true },
+  { key: "show_winds", label: "Show wind field", type: "bool", def: true },
+  { key: "show_timeline", label: "Show at-home wind timeline", type: "bool", def: true },
   { key: "smooth", label: "Smooth coastlines", type: "bool", def: true },
   { key: "coast_color", label: "Coastline color", type: "color" },
   { key: "land_color", label: "Land fill color", type: "color" },

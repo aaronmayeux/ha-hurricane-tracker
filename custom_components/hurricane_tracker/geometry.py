@@ -233,6 +233,245 @@ def _peak(points, cur_cat):
     return None
 
 
+def _closest_approach(points, home_lat, home_lon, cur_lat=None, cur_lon=None):
+    """Nearest point on the forecast-center track to home + the forecast hour
+    (tau) at that point. Returns (dist_mi, tau_hours).
+
+    Runs on the forecast `points` (each carries lat/lng AND tau) rather than the
+    denser fcstTrack line (which has no time), so the ETA is exact and the
+    distance is within a hair at NHC's 12-hourly cadence. The current center is
+    folded in as a tau-0 candidate so closest approach is never *farther* than
+    where the storm is right now -- a receding storm's closest point is 'now'.
+    (GDACS forecast points are reconstructed slightly off the reported center, so
+    without this the min over forecast points alone can read > current distance.)
+    Home is projected onto each segment in a local equirectangular frame (cos-lat
+    corrected) and clamped; tau is interpolated at the projection. tau_hours is
+    None when the points carry no tau (GDACS -> distance only, no ETA)."""
+    pts = [p for p in (points or [])
+           if p.get("lat") is not None and p.get("lng") is not None]
+    if cur_lat is not None and cur_lon is not None:
+        pts = [{"lat": cur_lat, "lng": cur_lon, "tau": 0.0}] + pts
+    if not pts:
+        return None, None
+    if len(pts) == 1:
+        p = pts[0]
+        return haversine_mi(home_lat, home_lon, p["lat"], p["lng"]), p.get("tau")
+
+    coslat = math.cos(math.radians(home_lat))
+    best_d, best_tau = None, None
+    for a, b in zip(pts, pts[1:]):
+        # local planar coords relative to home (origin); lon scaled by cos(lat)
+        ax = (a["lng"] - home_lon) * coslat
+        ay = a["lat"] - home_lat
+        dx = (b["lng"] - a["lng"]) * coslat
+        dy = b["lat"] - a["lat"]
+        seg2 = dx * dx + dy * dy
+        t = 0.0 if seg2 == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / seg2))
+        plng = a["lng"] + t * (b["lng"] - a["lng"])
+        plat = a["lat"] + t * (b["lat"] - a["lat"])
+        d = haversine_mi(home_lat, home_lon, plat, plng)
+        if best_d is None or d < best_d:
+            best_d = d
+            ta, tb = a.get("tau"), b.get("tau")
+            best_tau = (ta + t * (tb - ta)) if (ta is not None and tb is not None) else None
+    return best_d, best_tau
+
+
+# ---------------------------------------------------------------------------
+# Wind field (Phase 3): distance to the 34 kt edge + strongest field over home
+# ---------------------------------------------------------------------------
+def _pt_in_ring(lng, lat, ring):
+    """Ray-cast point-in-polygon on a closed ring of [lng, lat] pairs."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if ((yi > lat) != (yj > lat)) and \
+           (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _dist_to_ring_mi(home_lat, home_lon, ring):
+    """Shortest distance (mi) from home to a ring's boundary. Home is projected
+    onto each edge in a local cos-lat frame; the nearest point is measured with
+    haversine."""
+    coslat = math.cos(math.radians(home_lat))
+    best = None
+    for a, b in zip(ring, ring[1:]):
+        ax = (a[0] - home_lon) * coslat
+        ay = a[1] - home_lat
+        dx = (b[0] - a[0]) * coslat
+        dy = b[1] - a[1]
+        seg2 = dx * dx + dy * dy
+        t = 0.0 if seg2 == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / seg2))
+        plng = a[0] + t * (b[0] - a[0])
+        plat = a[1] + t * (b[1] - a[1])
+        d = haversine_mi(home_lat, home_lon, plat, plng)
+        if best is None or d < best:
+            best = d
+    return best
+
+
+def _wind_report(wind_field, home_lat, home_lon):
+    """(dist_mi, at_home_kt) for a storm's current wind field.
+
+    at_home_kt: strongest threshold (64/50/34) whose ring contains home, else
+      None. dist_mi: distance to the nearest 34 kt (TS-force) edge when home is
+      OUTSIDE the field; 0 when home is inside it; None when there's no field."""
+    if not wind_field:
+        return None, None
+    rings_by_kt = {w["kt"]: (w.get("rings") or []) for w in wind_field}
+    for kt in (64, 50, 34):
+        for ring in rings_by_kt.get(kt, []):
+            if len(ring) >= 3 and _pt_in_ring(home_lon, home_lat, ring):
+                return 0.0, kt
+    best = None
+    for ring in rings_by_kt.get(34, []):
+        if len(ring) >= 2:
+            d = _dist_to_ring_mi(home_lat, home_lon, ring)
+            if d is not None and (best is None or d < best):
+                best = d
+    return best, None
+
+
+# --- build a smooth wind ring from the 4 quadrant radii ---------------------
+# NHC issues wind extent as four numbers (NE/SE/SW/NW, nautical mi) per threshold.
+# Drawing that literally gives hard corners at the quadrant lines. Instead we treat
+# each radius as the value at its quadrant CENTER (45/135/225/315 deg) and blend
+# between them with a periodic cosine, sampling a dense ring. Result: one organic
+# lopsided blob, no visible quadrant seams, and (cosine never overshoots) the
+# extent never exceeds the issued radii.
+_R_NM = 3440.065
+_WIND_CTRL = [(45.0, "ne"), (135.0, "se"), (225.0, "sw"), (315.0, "nw")]
+
+
+def _wind_dest(clat, clon, brg, nm):
+    """[lng, lat] at bearing `brg` deg, distance `nm` nautical mi from center."""
+    d = nm / _R_NM
+    br = math.radians(brg)
+    la1, lo1 = math.radians(clat), math.radians(clon)
+    la2 = math.asin(math.sin(la1) * math.cos(d) +
+                    math.cos(la1) * math.sin(d) * math.cos(br))
+    lo2 = lo1 + math.atan2(math.sin(br) * math.sin(d) * math.cos(la1),
+                           math.cos(d) - math.sin(la1) * math.sin(la2))
+    return [round(math.degrees(lo2), 4), round(math.degrees(la2), 4)]
+
+
+def _wind_radius_at(brg, r):
+    """Smoothly interpolated radius (nm) at bearing `brg`, from quadrant radii
+    dict r (keys ne/se/sw/nw). Periodic cosine blend between quadrant centers."""
+    b = brg % 360.0
+    for i in range(4):
+        a_ang, a_key = _WIND_CTRL[i]
+        _, b_key = _WIND_CTRL[(i + 1) % 4]
+        span = (_WIND_CTRL[(i + 1) % 4][0] - a_ang) % 360.0
+        off = (b - a_ang) % 360.0
+        if off <= span:
+            t = off / span if span else 0.0
+            s = (1 - math.cos(math.pi * t)) / 2.0
+            return r[a_key] + (r[b_key] - r[a_key]) * s
+    return r["ne"]
+
+
+def _wind_ring_from_radii(clat, clon, r, step=5.0):
+    """Smooth closed lng/lat ring from quadrant radii dict r (ne/se/sw/nw, nm),
+    centered on the storm. None if all radii are zero."""
+    if max(r.get("ne", 0), r.get("se", 0),
+           r.get("sw", 0), r.get("nw", 0)) <= 0:
+        return None
+    ring = []
+    b = 0.0
+    while b < 360.0:
+        rad = _wind_radius_at(b, r)
+        ring.append([round(clon, 4), round(clat, 4)] if rad <= 0
+                    else _wind_dest(clat, clon, b, rad))
+        b += step
+    ring.append(ring[0])
+    return ring
+
+
+# ---------------------------------------------------------------------------
+# At-home exposure timeline (Phase 4): when is home inside each forecast field?
+# ---------------------------------------------------------------------------
+def _exposure_timeline(points, wind_forecast, home_lat, home_lon):
+    """For every forecast tau that carries wind radii, build that threshold's
+    smooth ring (centered on the tau's forecast position from `points`) and test
+    whether home is inside it. Contiguous exposed taus collapse into a window;
+    boundaries are the midpoints toward the neighbouring forecast times, so a
+    single-tau hit still reads as a real span and the 'possible' framing (the
+    card labels it) covers the coarseness.
+
+    Returns {"horizon": maxTau,
+             "rows": [{"kt": 34, "dataMaxTau": T, "windows": [[t0, t1], ...]}]}
+    with a row ONLY for thresholds home actually enters. None when there's no
+    forecast wind data or home never enters even the 34 kt field. Reuses the
+    Phase 3 ring builder + point-in-ring test, so the timeline and the on-map
+    wind wash come from identical geometry."""
+    if not wind_forecast or not points:
+        return None
+
+    # tau -> forecast center (from the forecast points, which carry lat/lng+tau)
+    centers = {}
+    for p in points:
+        t = p.get("tau")
+        if t is not None and p.get("lat") is not None and p.get("lng") is not None:
+            centers[round(float(t))] = (p["lat"], p["lng"])
+
+    # gather (tau, radii-dict) per threshold
+    per_kt = {34: [], 50: [], 64: []}
+    for entry in wind_forecast:
+        t = entry.get("tau")
+        if t is None:
+            continue
+        for r in entry.get("radii") or []:
+            if r.get("kt") in per_kt:
+                per_kt[r["kt"]].append((float(t), r))
+
+    rows = []
+    horizon = 0.0
+    for kt in (34, 50, 64):
+        seq = sorted(per_kt[kt], key=lambda tr: tr[0])
+        if not seq:
+            continue
+        taus = [t for t, _ in seq]
+        horizon = max(horizon, taus[-1])
+        exposed = []
+        for t, r in seq:
+            c = centers.get(round(t))
+            hit = False
+            if c:
+                ring = _wind_ring_from_radii(c[0], c[1], r)
+                if ring and _pt_in_ring(home_lon, home_lat, ring):
+                    hit = True
+            exposed.append(hit)
+        # contiguous exposed runs -> windows, midpoint-crossing boundaries
+        windows = []
+        n = len(taus)
+        i = 0
+        while i < n:
+            if not exposed[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and exposed[j + 1]:
+                j += 1
+            start = taus[i] if i == 0 else (taus[i - 1] + taus[i]) / 2.0
+            end = taus[j] if j == n - 1 else (taus[j] + taus[j + 1]) / 2.0
+            windows.append([round(start, 1), round(end, 1)])
+            i = j + 1
+        if windows:
+            rows.append({"kt": kt, "dataMaxTau": round(taus[-1], 1),
+                         "windows": windows})
+
+    if not rows:
+        return None
+    return {"horizon": round(horizon, 1), "rows": rows}
+
+
 def assemble_payload(storm, fdata, home_lat, home_lon, units):
     """Build the final card payload from a selected storm + its parsed GIS."""
     basemap = load_basemap()
@@ -284,6 +523,30 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
 
     dist_val = _dist_conv(dist_mi)
 
+    # Phase 3: current wind field (NHC-only). fdata carries per-threshold quadrant
+    # radii ({kt, ne, se, sw, nw} in nm); we build a smooth lopsided ring per
+    # threshold centered on the storm.
+    built_wind = []
+    if cur_lat is not None and cur_lng is not None:
+        for wr in (fdata.get("windField") or []):
+            ring = _wind_ring_from_radii(cur_lat, cur_lng, wr)
+            if ring:
+                built_wind.append({"kt": wr["kt"], "rings": [ring]})
+    wind_dist_mi, wind_at_home = _wind_report(built_wind, home_lat, home_lon)
+    wind_dist_val = _dist_conv(wind_dist_mi)
+
+    cpa_mi, cpa_hours = _closest_approach(points, home_lat, home_lon, cur_lat, cur_lng)
+    cpa_eye_val = _dist_conv(cpa_mi)   # center/eye basis, kept for the Phase 4 dot
+    # Keep closest-approach on the SAME distance basis the bar shows as "now". With a
+    # wind field the bar shows the wind-EDGE distance (nearer than the eye), so shift
+    # the eye-based closest approach in by the current eye->edge gap. cpa_mi <= dist_mi
+    # (Phase 1 guarantee), so the shifted value stays <= wind_dist_mi -- "closest"
+    # can never read farther than "now". No wind field -> both stay eye-based.
+    if wind_dist_mi is not None and dist_mi is not None and cpa_mi is not None:
+        cpa_mi = max(0.0, cpa_mi - (dist_mi - wind_dist_mi))
+    cpa_val = _dist_conv(cpa_mi)
+    cpa_hours_r = round(cpa_hours) if cpa_hours is not None else None
+
     bkey = storm_basin(storm)
     meta = {
         "name": fdata.get("name") or storm.get("name", ""),
@@ -294,12 +557,32 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "mslp": p0.get("mslp"),
         "moveText": move_text,
         "dist": dist_val,
+        "cpaDist": cpa_val,
+        "cpaHours": cpa_hours_r,
+        "hasWind": bool(built_wind),
+        "windDist": wind_dist_val,
+        "windAtHome": wind_at_home,
         "distUnit": dist_unit,
         "windUnit": wind_unit,
         "basin": bkey,
         "basinName": BASIN_NAME.get(bkey, ""),
         "peak": _peak(points, p0.get("cat", "TS")),
     }
+
+    # Phase 4: at-home exposure timeline (NHC-only; reuses the Phase 3 rings). Only
+    # attached when home actually enters a forecast wind field. refTime (epoch ms,
+    # UTC of tau=0) lets the card show wall-clock windows; absent -> card falls back
+    # to relative hours.
+    exposure = _exposure_timeline(points, fdata.get("windForecast"), home_lat, home_lon)
+    if exposure:
+        ref = fdata.get("refTime")
+        if ref is not None:
+            exposure["refTime"] = ref
+        # Center's closest pass (tau + eye distance) for the timeline dot -- the eye
+        # basis, NOT the wind-edge-shifted cpaDist the text bar uses.
+        if cpa_hours_r is not None:
+            exposure["cpa"] = {"tau": cpa_hours_r, "dist": cpa_eye_val}
+        meta["exposure"] = exposure
 
     return {
         "ok": True,
@@ -313,6 +596,7 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "pastTrack": past,
         "points": points,
         "ww": fdata.get("ww") or [],
+        "windField": built_wind,
         "geo": geo,
         "labels": labels,
         "meta": meta,
