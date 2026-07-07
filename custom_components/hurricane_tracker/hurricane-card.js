@@ -451,8 +451,24 @@ function buildConeSvg(st, cfg) {
   const region = cfg.show_labels !== false ? regionLabels(st.labels, proj, st.bbox, keepOut, conePx) : [];
   const scale = (farCase && cfg.show_scale !== false) ? scaleAxes(st.bbox, proj, st.geo, keepOut, conePx, hcx, hcy) : [];
 
-  const layers = [...base, ...windLayer, ...region, ...scale, ...storm, ...homeParts];
-  return `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">${layers.join("")}</svg>`;
+  // Two sibling groups. hu-pan holds the GEOGRAPHIC layers (basemap, wind wash,
+  // cone/track/dots/ww + on-dot labels) -- these scale honestly, so pan/zoom is a
+  // transform on this group alone. hu-overlays holds SCREEN-SPACE furniture (region
+  // names, off-screen home marker, offshore mileage scale) whose edge-clamp/keepOut
+  // math is only valid at the default frame; it hides whenever the view leaves default
+  // (set by the gesture layer) and returns on recenter. The outer viewBox is always
+  // the default 800x600 frame; the buffered coastline in `geo` extends past it and is
+  // simply clipped until a gesture reveals it. viewBox/maxScale ride as data-attrs so
+  // the gesture layer can read the pannable extent + zoom ceiling off the DOM.
+  const panGroup = [...base, ...windLayer, ...storm];
+  const overlayGroup = [...region, ...scale, ...homeParts];
+  const vb = st.viewBox ? st.viewBox.join(" ") : "";
+  const ms = st.maxScale != null ? st.maxScale : 1;
+  return `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
+    + ` data-viewbox="${vb}" data-maxscale="${ms}" data-bbox="${(st.bbox || []).join(" ")}" xmlns="http://www.w3.org/2000/svg">`
+    + `<g class="hu-pan">${panGroup.join("")}</g>`
+    + `<g class="hu-overlays">${overlayGroup.join("")}</g>`
+    + `</svg>`;
 }
 
 function dataBar(st) {
@@ -591,7 +607,18 @@ const STYLE = `
   .hu-tag { font: 600 13px/1 var(--ha-card-header-font-family, inherit); letter-spacing: .08em;
             text-transform: uppercase; color: var(--secondary-text-color); padding: 12px 14px 8px; }
   .hu-conewrap { position: relative; width: 100%; background: var(--hu-bg, var(--primary-background-color)); }
-  .hu-svg { display: block; width: 100%; height: auto; }
+  .hu-svg { display: block; width: 100%; height: auto; touch-action: none; }
+  .hu-svg.hu-zoomable { cursor: grab; }
+  .hu-svg.hu-zoomable.hu-grabbing { cursor: grabbing; }
+  .hu-pan { will-change: transform; }
+  .hu-overlays.hu-hide { display: none; }
+  .hu-recenter { position: absolute; top: 10px; right: 10px; z-index: 2; display: none;
+                 align-items: center; gap: 5px; border: none; cursor: pointer;
+                 background: var(--secondary-background-color); color: var(--primary-text-color);
+                 border-radius: 16px; padding: 5px 11px 5px 9px; font: 600 12px/1 sans-serif;
+                 box-shadow: 0 1px 4px rgba(0,0,0,.3); opacity: .94; }
+  .hu-recenter.hu-show { display: inline-flex; }
+  .hu-recenter ha-icon { --mdc-icon-size: 15px; }
   .hu-land { fill: var(--hu-land-color, var(--divider-color)); opacity: var(--hu-land-opacity, .55); stroke: none; }
   .hu-state { fill: none; stroke: var(--hu-state-color, var(--secondary-text-color)); stroke-width: var(--hu-state-width, .6); opacity: .4; }
   .hu-coast { fill: none; stroke: var(--hu-coast-color, var(--primary-text-color)); stroke-width: var(--hu-coast-width, 1); opacity: var(--hu-coast-opacity, .7); stroke-linejoin: round; stroke-linecap: round; }
@@ -646,7 +673,7 @@ const STYLE = `
 `;
 
 class HurricaneCard extends HTMLElement {
-  constructor() { super(); this._data = null; this._err = false; this._idx = 0; this._timer = null; this._built = false; }
+  constructor() { super(); this._data = null; this._err = false; this._idx = 0; this._timer = null; this._built = false; this._savedView = null; this._viewStormId = null; this._resetView = false; }
 
   setConfig(config) { this._config = config || {}; if (this.shadowRoot) this._render(); }
   getCardSize() { return 6; }
@@ -668,15 +695,33 @@ class HurricaneCard extends HTMLElement {
   _fetch() {
     if (!this._hass) return;
     this._hass.callWS({ type: WS_TYPE }).then((res) => {
+      const prevId = this._currentStormId();   // remember which storm the user is on
       this._data = res && res.data ? res.data : null;
       this._lastOk = res ? res.last_success !== false : true;
       this._err = false;
-      this._idx = 0;
+      // Keep the user on the same storm across a background poll (don't snap to
+      // storm 1). Re-find it by id in the new list; fall back to 0 if it's gone.
+      // A poll is NOT a storm switch, so the pan/zoom view is preserved (see
+      // _setupPanZoom) -- only an explicit pager tap or a storm change resets it.
+      const storms = (this._data && this._data.storms) || [];
+      let idx = 0;
+      if (prevId != null) {
+        const found = storms.findIndex((s) => s.stormId === prevId);
+        if (found >= 0) idx = found;
+      }
+      this._idx = idx;
       this._render();
     }).catch(() => {
       // Keep the last good render if we have one; only surface an error on cold start.
       if (!this._data) { this._err = true; this._render(); }
     });
+  }
+
+  // Id of the storm currently shown (for view/selection continuity across polls).
+  _currentStormId() {
+    const storms = (this._data && this._data.storms) || [];
+    const st = storms[this._idx];
+    return st ? (st.stormId || null) : null;
   }
 
   _msg(icon, title, sub, spin) {
@@ -723,7 +768,7 @@ class HurricaneCard extends HTMLElement {
       try { svg = buildConeSvg(st, cfg); }
       catch (e) { svg = this._msg("mdi:map-marker-alert", "Couldn\u2019t draw this storm", "", false); }
       body = `<div class="hu-tag">${esc(tagName)}</div>
-        <div class="hu-conewrap">${svg}</div>
+        <div class="hu-conewrap">${svg}<button class="hu-recenter" aria-label="Recenter map"><ha-icon icon="mdi:image-filter-center-focus"></ha-icon>Recenter</button></div>
         <div class="hu-bar">${dataBar(st)}</div>${exposureTimeline(st, cfg)}${pager}${stale}`;
     } else if (d.reason === "none_matched") {
       const n = d.activeAnywhere || 0;
@@ -760,8 +805,194 @@ class HurricaneCard extends HTMLElement {
         const n = Number(b.getAttribute("data-nav"));
         const len = (this._data.storms || []).length;
         this._idx = (this._idx + n + len) % len;
+        this._resetView = true;   // explicit storm switch -> reset pan/zoom to default
         this._render();
       }));
+
+    // Rebuild attaches a fresh gesture layer. Whether it starts at the default
+    // frame or restores the user's zoom/pan is decided in _setupPanZoom: a storm
+    // switch or a storm-identity change resets; a background poll of the SAME storm
+    // preserves the view so it doesn't snap out from under the user mid-read.
+    this._setupPanZoom();
+  }
+
+  /* ---- pan / zoom (Session C) -----------------------------------------------
+   * The map layers (hu-pan group) are transformed in SVG user space; the buffered
+   * coastline baked into the payload extends past the 800x600 frame, so panning
+   * just reveals already-drawn geometry -- no re-fetch, no reprojection, no DOM
+   * rebuild. Pointer Events cover mouse drag, touch drag, and two-finger pinch;
+   * wheel zooms at the cursor. Transform writes are rAF-batched. Screen-space
+   * overlays hide off-default and return on recenter. */
+  _setupPanZoom() {
+    const svg = this.shadowRoot.querySelector(".hu-svg");
+    // Decide reset vs restore ONCE per render, then clear the one-shot flag. Reset
+    // when: an explicit storm switch (pager set _resetView), or the shown storm's
+    // id differs from the one the saved view belongs to (storm changed under us).
+    const stormId = this._currentStormId();
+    const reset = this._resetView === true || this._viewStormId !== stormId;
+    this._resetView = false;
+    if (!svg) { this._view = null; this._savedView = null; this._viewStormId = stormId; return; }
+    const pan = svg.querySelector(".hu-pan");
+    const overlays = svg.querySelector(".hu-overlays");
+    const btn = this.shadowRoot.querySelector(".hu-recenter");
+    const vb = (svg.getAttribute("data-viewbox") || "").split(" ").map(Number).filter((x) => !isNaN(x));
+    const bb = (svg.getAttribute("data-bbox") || "").split(" ").map(Number).filter((x) => !isNaN(x));
+    const maxScale = Number(svg.getAttribute("data-maxscale")) || 1;
+    if (!pan || vb.length !== 4 || bb.length !== 4 || maxScale <= 1) {
+      // No buffered frame (older payload) or nothing to zoom into: leave the map
+      // static, exactly as before Session C.
+      this._view = null; this._savedView = null; this._viewStormId = stormId;
+      return;
+    }
+    svg.classList.add("hu-zoomable");
+
+    // Pannable pixel extent. The default frame maps bbox -> 0..VBW / 0..VBH. The
+    // buffered viewBox is wider by (vb_span / bb_span); drawn through the SAME
+    // default projection, its edges land that many px outside the frame. At scale s
+    // the on-screen content spans s*VBW; translate is clamped so you can pan to the
+    // buffer edge but no further into empty space. Longitude uses the x ratio,
+    // latitude the y ratio (handles the aspect-fitted bbox + antimeridian-wrapped
+    // viewBox alike: the wrap is already resolved in the baked pixel coords, so we
+    // only ever reason about pixel spans here, never longitudes).
+    const bbW = bb[2] - bb[0], bbH = bb[3] - bb[1];
+    const marginX = bbW > 0 ? ((vb[2] - vb[0]) / bbW - 1) / 2 * VBW : 0;  // px of buffer past each L/R edge
+    const marginY = bbH > 0 ? ((vb[3] - vb[1]) / bbH - 1) / 2 * VBH : 0;  // px past each T/B edge
+
+    // Zoom-out floor: at scale 1 the content fills the frame; the buffered viewBox
+    // is (vb/bb)x wider, so zooming out to bb/vb (~0.5 for the 2x buffer) makes the
+    // WHOLE baked buffer fit the frame. That's as far out as there's geometry to
+    // show -- past it is empty. Derived from the payload so it tracks the buffer
+    // factor. Never let the floor exceed 1 (guards a degenerate/absent buffer).
+    const minScale = Math.min(1, Math.max(bbW / (vb[2] - vb[0] || bbW),
+                                          bbH / (vb[3] - vb[1] || bbH)));
+
+    // Start at the default frame on a reset (storm switch / new storm); otherwise
+    // restore the view the user left on the SAME storm before this poll rebuilt the
+    // DOM. The restored value is clamped below, so a slightly different frame can't
+    // push it out of bounds.
+    const saved = (!reset && this._savedView) ? this._savedView : null;
+    const view = saved ? { s: saved.s, tx: saved.tx, ty: saved.ty } : { s: 1, tx: 0, ty: 0 };
+    this._view = view;
+    this._viewStormId = stormId;
+    let raf = 0;
+    const EPS = 0.001;
+    const isDefault = () => view.s <= 1 + EPS && view.s >= 1 - EPS
+                          && Math.abs(view.tx) < 0.5 && Math.abs(view.ty) < 0.5;
+
+    // Legal translate slack at a given scale. Above s=1 you can pan across the
+    // zoomed content + into the baked buffer. At/below s=1 the content is no larger
+    // than the frame, so slack floors at 0 -> the map stays centered. HARD limits:
+    // no rubber-band, no overpan -- the clamp is applied every frame in apply().
+    const slackAt = (s) => [
+      Math.max(0, (s - 1) * VBW / 2) + marginX * s,
+      Math.max(0, (s - 1) * VBH / 2) + marginY * s,
+    ];
+    const clampScale = (s) => Math.max(minScale, Math.min(maxScale, s));
+    const clamp = () => {
+      view.s = clampScale(view.s);
+      const [sx, sy] = slackAt(view.s);
+      view.tx = Math.max(-sx, Math.min(sx, view.tx));
+      view.ty = Math.max(-sy, Math.min(sy, view.ty));
+    };
+
+    const apply = () => {
+      raf = 0;
+      clamp();   // enforce hard bounds before every paint -- nothing illegal renders
+      pan.setAttribute("transform", `translate(${view.tx.toFixed(2)} ${view.ty.toFixed(2)}) scale(${view.s.toFixed(4)})`);
+      const def = isDefault();
+      overlays && overlays.classList.toggle("hu-hide", !def);
+      btn && btn.classList.toggle("hu-show", !def);
+      // Remember the live view so a background poll (which rebuilds the DOM) can
+      // restore it. Cleared to null when at the default frame, so a fresh storm or
+      // a recenter starts clean.
+      this._savedView = def ? null : { s: view.s, tx: view.tx, ty: view.ty };
+    };
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(apply); };
+
+    // px per SVG user-unit (the SVG is width:100%, so this varies with card width)
+    const scaleFactor = () => {
+      const r = svg.getBoundingClientRect();
+      return r.width ? VBW / r.width : 1;   // client px -> user units
+    };
+    // client coords -> SVG user coords (pre-transform frame)
+    const toUser = (clientX, clientY) => {
+      const r = svg.getBoundingClientRect();
+      const f = scaleFactor();
+      return [(clientX - r.left) * f, (clientY - r.top) * f];
+    };
+    // Zoom about a fixed user-space point, holding that point under the cursor/pinch.
+    // Scale is clamped to [minScale, maxScale] FIRST, then the translate is derived
+    // from the clamped scale -- so a zoom that hits a limit produces no leftover
+    // translate drift (the old bug where repeated wheel-in crept down-right).
+    const zoomAt = (ux, uy, ns) => {
+      ns = clampScale(ns);
+      const k = ns / view.s;
+      view.tx = ux - (ux - view.tx) * k;
+      view.ty = uy - (uy - view.ty) * k;
+      view.s = ns;
+      schedule();
+    };
+
+    const pointers = new Map();
+    let pinchDist = 0, pinchMid = [0, 0];
+
+    const onDown = (e) => {
+      pointers.set(e.pointerId, e);
+      svg.setPointerCapture(e.pointerId);
+      svg.classList.add("hu-grabbing");
+      if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        pinchDist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1;
+        pinchMid = toUser((a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2);
+      }
+    };
+    const onMove = (e) => {
+      if (!pointers.has(e.pointerId)) return;
+      const prev = pointers.get(e.pointerId);
+      pointers.set(e.pointerId, e);
+      const f = scaleFactor();
+      if (pointers.size === 1) {
+        view.tx += (e.clientX - prev.clientX) * f;
+        view.ty += (e.clientY - prev.clientY) * f;
+        schedule();   // clamp() in apply() bounds it -- can't pan past the edge
+      } else if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1;
+        const mid = toUser((a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2);
+        // pan by the midpoint drift, then scale about the current midpoint
+        view.tx += mid[0] - pinchMid[0];
+        view.ty += mid[1] - pinchMid[1];
+        pinchMid = mid;
+        zoomAt(mid[0], mid[1], view.s * (dist / pinchDist));
+        pinchDist = dist;
+      }
+    };
+    const onUp = (e) => {
+      pointers.delete(e.pointerId);
+      try { svg.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (pointers.size < 2) pinchDist = 0;
+      if (pointers.size === 0) svg.classList.remove("hu-grabbing");
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      const [ux, uy] = toUser(e.clientX, e.clientY);
+      const factor = Math.exp(-e.deltaY * 0.0015);   // smooth, direction-correct
+      zoomAt(ux, uy, view.s * factor);
+    };
+
+    svg.addEventListener("pointerdown", onDown);
+    svg.addEventListener("pointermove", onMove);
+    svg.addEventListener("pointerup", onUp);
+    svg.addEventListener("pointercancel", onUp);
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    btn && btn.addEventListener("click", () => {
+      view.s = 1; view.tx = 0; view.ty = 0; schedule();
+    });
+
+    // If we restored a non-default view (background poll of the same storm), paint
+    // it now so the map comes back exactly where the user left it -- not at default
+    // for a frame until the next gesture.
+    if (saved) schedule();
   }
 }
 
