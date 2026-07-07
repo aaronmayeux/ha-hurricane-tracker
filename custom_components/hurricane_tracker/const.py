@@ -137,6 +137,23 @@ PAST_MILES = 110
 CACHE_STORAGE_KEY = "hurricane_tracker_bake_cache"
 CACHE_STORAGE_VERSION = 1
 
+# --- zoom / pan (buffered clip) ---------------------------------------------
+# The card lets the user pinch/drag/wheel to zoom+pan the map. To keep that a
+# pure client-side transform (no re-fetch, no DOM rebuild mid-gesture), the bake
+# clips a BUFFER larger than the default storm frame -- so there's already-baked
+# coastline to reveal when panning/zooming. The default view is unchanged: it
+# still frames on the storm bbox at the default point budget, so default-zoom
+# coastline quality is byte-identical to before. The buffer is baked at the
+# DEFAULT frame's detail level (tolerance pinned to the default span, not the
+# buffer span), so zoomed-in coast stays sharp -- that costs points, hence the
+# higher budget + a hard payload cap. Measured (Aaron's Mac, in-container):
+# a 2x sharp buffer lands ~16-17k pts / ~290-325 KB, tolerance-floor limited,
+# well under the cap; clip ~150-420 ms in the executor, off the event loop.
+ZOOM_BUFFER_FACTOR = 2.0     # buffered extent = this * the default frame, about its center
+ZOOM_POINT_BUDGET = 20000    # simplification ceiling for the buffered clip (a cap, not a target)
+ZOOM_PAYLOAD_CAP_BYTES = 400000  # hard cap on the serialized geo; back off tolerance until under
+ZOOM_MAX_SCALE = 3.0         # card zoom-in limit (past this the DP coastline reads chunky)
+
 # --- frontend ---------------------------------------------------------------
 CARD_FILENAME = "hurricane-card.js"
 FRONTEND_URL_BASE = "/hurricane_tracker_frontend"

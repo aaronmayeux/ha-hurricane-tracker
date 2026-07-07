@@ -12,6 +12,7 @@ deep the zoom. The card smooths the budgeted points into curves at draw time.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import struct
@@ -19,6 +20,10 @@ import struct
 from .const import (
     BASIN_NAME,
     UNIT_KM,
+    ZOOM_BUFFER_FACTOR,
+    ZOOM_MAX_SCALE,
+    ZOOM_PAYLOAD_CAP_BYTES,
+    ZOOM_POINT_BUDGET,
 )
 from .nhc import compass, haversine_mi, storm_basin
 from .regions import REGION_LABELS
@@ -148,16 +153,30 @@ def _dp(pts, tol):
     return [pts[i] for i, k in enumerate(keep) if k]
 
 
-def clip_basemap(basemap, bbox, pad):
-    """Decode the in-view parts of each layer and simplify to the point budget.
+def clip_basemap(basemap, bbox, pad, ref_span=None, budget=None, cap_bytes=None):
+    """Decode the in-view parts of each layer and simplify to a point budget.
     Coastlines get finer detail when zoomed in and thin out when zoomed out; the
-    total point count is capped so the payload never blows up."""
+    total point count is capped so the payload never blows up.
+
+    Default view (ref_span=None): tolerance is set from THIS bbox's own span, so
+    detail matches the frame -- unchanged behaviour, used for the default clip.
+
+    Buffered clip (ref_span given): tolerance is pinned to ref_span (the DEFAULT
+    frame's span), NOT this larger buffered bbox's span. That keeps the revealed
+    buffer at the same per-degree sharpness as the default view, so zooming in
+    doesn't show chunky coast -- at the cost of more points, hence the higher
+    budget. cap_bytes, when given, is a HARD ceiling on the serialized geo: after
+    the point-budget pass, if the JSON is still over cap we keep backing off the
+    tolerance until it fits (guards a pathological dense frame)."""
     raw = {name: basemap.clip(name, bbox, pad) for name in _LAYER_NAMES}
     span = max(bbox[2] - bbox[0], bbox[3] - bbox[1], 0.01)
+    tol_span = ref_span if ref_span is not None else span
+    max_pts = budget if budget is not None else _POINT_BUDGET
 
     # Start near screen resolution, then back off (coarser) until under budget.
-    tol = span / 700.0
-    for _ in range(7):
+    tol = tol_span / 700.0
+    simplified = {}
+    for _ in range(9):
         simplified = {}
         total = 0
         for name in _LAYER_NAMES:
@@ -170,14 +189,38 @@ def clip_basemap(basemap, bbox, pad):
                 parts.append(s)
                 total += len(s)
             simplified[name] = parts
-        if total <= _POINT_BUDGET:
+        if total <= max_pts:
             break
         tol *= 1.7
 
-    return {
+    geo = {
         name: [[[round(x, 4), round(y, 4)] for x, y in part] for part in simplified[name]]
         for name in _LAYER_NAMES
     }
+
+    # Hard payload cap: keep coarsening until the serialized geo fits. Only the
+    # buffered clip passes cap_bytes; the default view leaves it None (no cap).
+    if cap_bytes is not None:
+        for _ in range(6):
+            if len(json.dumps(geo, separators=(",", ":"))) <= cap_bytes:
+                break
+            tol *= 1.7
+            simplified = {}
+            for name in _LAYER_NAMES:
+                minp = _MIN_PTS[name]
+                parts = []
+                for part in raw[name]:
+                    s = _dp(part, tol)
+                    if len(s) < minp:
+                        continue
+                    parts.append(s)
+                simplified[name] = parts
+            geo = {
+                name: [[[round(x, 4), round(y, 4)] for x, y in part] for part in simplified[name]]
+                for name in _LAYER_NAMES
+            }
+
+    return geo
 
 
 # ---------------------------------------------------------------------------
@@ -483,11 +526,34 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     bbox = compute_bbox(cone, fcst, past)
     if not bbox:
         return None
-    pad = max((bbox[2] - bbox[0]), (bbox[3] - bbox[1])) * 0.15
-    geo = clip_basemap(basemap, bbox, pad)
 
-    # Region labels whose anchor falls in view; the card decides what to draw and
-    # hides any that would collide with storm data.
+    # Buffered clip for zoom/pan. The DEFAULT view still frames on `bbox`; we bake
+    # a larger `viewBox` (ZOOM_BUFFER_FACTOR * the frame, about its center) at the
+    # default frame's detail level so the card has sharp, already-baked coastline
+    # to reveal when the user pans/zooms -- no re-fetch, no DOM rebuild. Tolerance
+    # is pinned to the DEFAULT span, so default-zoom quality is unchanged; the
+    # zoom budget + hard byte cap keep the bigger clip bounded. Longitude half-
+    # width is NOT cos-lat corrected here (bbox is already aspect-fitted in
+    # lng/lat degrees; we just scale it uniformly about center).
+    def_w = bbox[2] - bbox[0]
+    def_h = bbox[3] - bbox[1]
+    def_span = max(def_w, def_h, 0.01)
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    hw = def_w / 2.0 * ZOOM_BUFFER_FACTOR
+    hh = def_h / 2.0 * ZOOM_BUFFER_FACTOR
+    view_box = [round(cx - hw, 3), round(cy - hh, 3),
+                round(cx + hw, 3), round(cy + hh, 3)]
+    pad = def_span * 0.15
+    geo = clip_basemap(basemap, view_box, pad,
+                       ref_span=def_span,
+                       budget=ZOOM_POINT_BUDGET,
+                       cap_bytes=ZOOM_PAYLOAD_CAP_BYTES)
+
+    # Region labels whose anchor falls in the DEFAULT frame; the card decides what
+    # to draw and hides any that would collide with storm data. (Overlays are only
+    # valid at the default frame -- they hide on zoom -- so anchor selection stays
+    # keyed to bbox, not the buffered viewBox.)
     labels = [r for r in REGION_LABELS
               if bbox[0] <= r["lng"] <= bbox[2] and bbox[1] <= r["lat"] <= bbox[3]]
 
@@ -601,6 +667,8 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "stormId": storm.get("id", ""),
         "advisory": fdata.get("advisory", ""),
         "bbox": bbox,
+        "viewBox": view_box,      # buffered extent baked into geo; card pan/zoom clamp
+        "maxScale": ZOOM_MAX_SCALE,
         "home": [home_lon, home_lat],
         "cur": [cur_lng, cur_lat] if cur_lng is not None else None,
         "cone": cone,
