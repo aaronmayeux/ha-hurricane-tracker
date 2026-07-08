@@ -25,7 +25,7 @@ from .const import (
     ZOOM_PAYLOAD_CAP_BYTES,
     ZOOM_POINT_BUDGET,
 )
-from .nhc import compass, haversine_mi, storm_basin
+from .nhc import bearing_deg, compass, haversine_mi, storm_basin
 from .regions import REGION_LABELS
 
 _BASEMAP_PATH = os.path.join(os.path.dirname(__file__), "basemap.bin")
@@ -438,6 +438,83 @@ def _wind_ring_from_radii(clat, clon, r, step=5.0):
 
 
 # ---------------------------------------------------------------------------
+# Wind SWATH corridor: a tapering tube along the forecast track, the way GDACS
+# draws its bands. At each forecast point we take the LARGEST of the four quadrant
+# radii (the outer extent) and offset the track line perpendicular by that radius
+# on each side; the two edges plus rounded end caps form one smooth corridor per
+# threshold. Symmetric about the track on purpose (that's GDACS's model) and cheap
+# -- ~2N + caps points, not a pile of overlapping blobs.
+# ---------------------------------------------------------------------------
+def _circle_ring(clat, clon, r_nm, step=30.0):
+    ring = []
+    b = 0.0
+    while b < 360.0:
+        ring.append(_wind_dest(clat, clon, b, r_nm))
+        b += step
+    ring.append(ring[0])
+    return ring
+
+
+def _cap_arc(clat, clon, r_nm, hdg, front, n=4):
+    """Interior arc points rounding one end of the corridor: the outboard half-
+    circle from the left edge round to the right edge (front=True sweeps through the
+    forward heading; False through the rear). Endpoints are already the edge points,
+    so we emit only the interior samples."""
+    if r_nm <= 0:
+        return []
+    a0, a1 = (hdg - 90.0, hdg + 90.0) if front else (hdg + 90.0, hdg + 270.0)
+    return [_wind_dest(clat, clon, (a0 + (a1 - a0) * k / n) % 360.0, r_nm)
+            for k in range(1, n)]
+
+
+def _order_along_track(pts, slng, slat):
+    """Order swath points into a track sequence: start at the one nearest the storm's
+    current position, then nearest-neighbour chain. Recovers travel order without
+    trusting GDACS's messy time labels."""
+    rem = list(pts)
+    if not rem:
+        return []
+    i0 = min(range(len(rem)),
+             key=lambda i: (rem[i]["lng"] - slng) ** 2 + (rem[i]["lat"] - slat) ** 2)
+    ordered = [rem.pop(i0)]
+    while rem:
+        last = ordered[-1]
+        j = min(range(len(rem)),
+                key=lambda i: (rem[i]["lng"] - last["lng"]) ** 2
+                + (rem[i]["lat"] - last["lat"]) ** 2)
+        ordered.append(rem.pop(j))
+    return ordered
+
+
+def _corridor_ring(pts):
+    """One smooth corridor outline from ordered swath points (each {lng,lat,ne,se,
+    sw,nw}); half-width at each point is the max quadrant radius. None if no extent."""
+    n = len(pts)
+    if n == 0:
+        return None
+    radii = [max(p.get("ne", 0), p.get("se", 0),
+                 p.get("sw", 0), p.get("nw", 0)) for p in pts]
+    if max(radii) <= 0:
+        return None
+    if n == 1:
+        return _circle_ring(pts[0]["lat"], pts[0]["lng"], radii[0])
+    hdgs, left, right = [], [], []
+    for i in range(n):
+        a = pts[max(0, i - 1)]
+        b = pts[min(n - 1, i + 1)]
+        hdg = bearing_deg(a["lat"], a["lng"], b["lat"], b["lng"])
+        hdgs.append(hdg)
+        left.append(_wind_dest(pts[i]["lat"], pts[i]["lng"], (hdg - 90.0) % 360.0, radii[i]))
+        right.append(_wind_dest(pts[i]["lat"], pts[i]["lng"], (hdg + 90.0) % 360.0, radii[i]))
+    ring = list(left)
+    ring += _cap_arc(pts[-1]["lat"], pts[-1]["lng"], radii[-1], hdgs[-1], True)
+    ring += list(reversed(right))
+    ring += _cap_arc(pts[0]["lat"], pts[0]["lng"], radii[0], hdgs[0], False)
+    ring.append(ring[0])
+    return ring
+
+
+# ---------------------------------------------------------------------------
 # At-home exposure timeline (Phase 4): when is home inside each forecast field?
 # ---------------------------------------------------------------------------
 def _exposure_timeline(points, wind_forecast, home_lat, home_lon):
@@ -589,17 +666,39 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
 
     dist_val = _dist_conv(dist_mi)
 
-    # Phase 3: current wind field (NHC-only). fdata carries per-threshold quadrant
-    # radii ({kt, ne, se, sw, nw} in nm); we build a smooth lopsided ring per
-    # threshold centered on the storm.
-    built_wind = []
+    # Current-position wind field (drives the bar's distance/at-home line -- "now"
+    # semantics). Per-threshold quadrant radii ({kt, ne, se, sw, nw} in nm) -> one
+    # smooth lopsided ring per threshold centered on the storm. NHC gets the radii
+    # from the MapServer; GDACS reduces its current band trio to the same schema, so
+    # both rebuild through the identical cosine-interpolated builder -- no faceting.
+    built_current = []
     if cur_lat is not None and cur_lng is not None:
         for wr in (fdata.get("windField") or []):
             ring = _wind_ring_from_radii(cur_lat, cur_lng, wr)
             if ring:
-                built_wind.append({"kt": wr["kt"], "rings": [ring]})
-    wind_dist_mi, wind_at_home = _wind_report(built_wind, home_lat, home_lon)
+                built_current.append({"kt": wr["kt"], "rings": [ring]})
+    wind_dist_mi, wind_at_home = _wind_report(built_current, home_lat, home_lon)
     wind_dist_val = _dist_conv(wind_dist_mi)
+
+    # Wind SWATH (drawn): one tapering band per threshold along the whole track. Two
+    # ways in, one look out:
+    #  - GDACS emits its OWN pre-built band polygon (tier['ring']); we just simplify it
+    #    -> an exact mirror of the GDACS map.
+    #  - NHC has no such polygon, so we build the corridor (tier['points']): order the
+    #    forecast points, offset the max quadrant radius perpendicular from the track,
+    #    close with rounded caps.
+    # Falls back to the current-position blob when there's no swath. Cheap either way.
+    built_swath = []
+    for tier in (fdata.get("windSwath") or []):
+        ring = None
+        if tier.get("ring"):
+            r = tier["ring"]
+            ring = _dp(r, 0.04) if len(r) > 40 else r
+        elif tier.get("points"):
+            ring = _corridor_ring(_order_along_track(tier["points"], cur_lng, cur_lat))
+        if ring and len(ring) >= 3:
+            built_swath.append({"kt": tier["kt"], "rings": [ring]})
+    built_wind = built_swath if built_swath else built_current
 
     cpa_mi, cpa_hours = _closest_approach(points, home_lat, home_lon, cur_lat, cur_lng)
     cpa_eye_val = _dist_conv(cpa_mi)   # center/eye basis, kept for the Phase 4 dot
@@ -625,7 +724,7 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "dist": dist_val,
         "cpaDist": cpa_val,
         "cpaHours": cpa_hours_r,
-        "hasWind": bool(built_wind),
+        "hasWind": bool(built_current),
         "windDist": wind_dist_val,
         "windAtHome": wind_at_home,
         "distUnit": dist_unit,

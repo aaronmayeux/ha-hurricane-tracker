@@ -29,6 +29,11 @@ const catColor = (c) => CAT_COLOR[c] || CAT_COLOR.TS;
 const WW_COLOR = { TWA: "#FFE14D", TWR: "#3B7DDB", HWA: "#FF6FB0", HWR: "#E03030" };
 const wwColor = (t) => WW_COLOR[(t || "").toUpperCase()] || null;
 
+/* Wind-band identity colors, GDACS-style: green 34kt / orange 50kt / red 64kt,
+ * drawn nested (34 widest/bottom -> 64 core/top). Fixed hexes like the cat ramp. */
+const WIND_BAND = { 34: "#43A047", 50: "#FB8C00", 64: "#E53935" };
+const windBandColor = (kt) => WIND_BAND[kt] || "var(--primary-text-color)";
+
 /* Config knobs -> CSS custom properties. Each is optional; unset falls back to
  * the theme default baked into STYLE. Keeps per-card theming declarative. */
 const COLOR_VARS = {
@@ -371,10 +376,16 @@ function buildConeSvg(st, cfg) {
   // smoothing, not circularizing.
   const windLayer = [];
   if (cfg.show_winds !== false && st.windField && st.windField.length)
-    for (const w of st.windField)
+    for (const w of st.windField) {
+      // Union the tier's rings into ONE path so the blobs along the track merge into
+      // a single uniform fill (nonzero winding) -- no darker seams where they overlap.
+      // One blob (current-position field) or many (the wind swath) both work here.
+      // Nested 34/50/64 tiers stay separate stacked paths -> alpha deepens in the core.
+      let d = "";
       for (const ring of (w.rings || []))
-        if (ring.length >= 3)
-          windLayer.push(`<path class="hu-wind" d="${basePath(proj, ring, true, smooth)}"/>`);
+        if (ring.length >= 3) d += basePath(proj, ring, true, smooth);
+      if (d) windLayer.push(`<path class="hu-wind" style="fill:${windBandColor(w.kt)}" d="${d}"/>`);
+    }
 
   const storm = [];
   for (const seg of st.ww || []) {
@@ -628,7 +639,7 @@ const STYLE = `
   .hu-scale-tick { stroke: var(--secondary-text-color); stroke-width: 1.5; opacity: .55; }
   .hu-scale-label { font: 600 11px/1 sans-serif; fill: var(--secondary-text-color); opacity: .7;
                     paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
-  .hu-wind { fill: var(--primary-text-color); fill-opacity: .13; stroke: none; }
+  .hu-wind { fill-opacity: .42; stroke: none; }
   .hu-ww { fill: none; stroke-width: 4; stroke-linecap: round; }
   .hu-cone-poly { fill: var(--hu-cone-color, var(--primary-text-color)); fill-opacity: .08; stroke: var(--hu-cone-color, var(--primary-text-color)); stroke-opacity: .3; stroke-width: 1; }
   .hu-track-past { fill: none; stroke: var(--hu-track-past-color, var(--secondary-text-color)); stroke-width: 2; stroke-dasharray: 4 5; opacity: .6; }

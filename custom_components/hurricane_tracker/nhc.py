@@ -580,6 +580,49 @@ def fetch_wind_forecast(storm):
         return []
 
 
+def build_wind_swath(fdata, storm):
+    """Assemble the wind swath from the current wind field + per-tau forecast radii,
+    each centered on its matching forecast point. Emits the SAME normalized schema
+    gdacs._wind_swath_from_bands does, so geometry draws an identical wind corridor
+    for both sources:
+      [{"kt": 34, "points": [{"lat":..,"lng":..,"ne":..,"se":..,"sw":..,"nw":..}, ...]}, ...]
+    Current position is the tau-0 point (from windField); tau>0 points come from
+    windForecast paired to the forecast `points` by rounded tau. [] when there's no
+    wind data (NHC-only; soft-fails with the rest of the wind pipeline).
+    """
+    wf = fdata.get("windField") or []
+    wfc = fdata.get("windForecast") or []
+    pts = fdata.get("points") or []
+    cur_lat = _num(storm.get("latitudeNumeric"))
+    cur_lng = _num(storm.get("longitudeNumeric"))
+    centers = {}
+    for p in pts:
+        t = p.get("tau")
+        if t is not None and p.get("lat") is not None and p.get("lng") is not None:
+            centers[round(float(t))] = (p["lat"], p["lng"])
+    bykt = {34: [], 50: [], 64: []}
+
+    def _add(kt, lat, lng, r):
+        if kt in bykt:
+            bykt[kt].append({"lat": round(lat, 4), "lng": round(lng, 4),
+                             "ne": r.get("ne", 0), "se": r.get("se", 0),
+                             "sw": r.get("sw", 0), "nw": r.get("nw", 0)})
+
+    if cur_lat is not None and cur_lng is not None:
+        for r in wf:
+            _add(r.get("kt"), cur_lat, cur_lng, r)
+    for entry in wfc:
+        t = entry.get("tau")
+        if t is None:
+            continue
+        c = centers.get(round(float(t)))
+        if not c:
+            continue
+        for r in entry.get("radii") or []:
+            _add(r.get("kt"), c[0], c[1], r)
+    return [{"kt": kt, "points": bykt[kt]} for kt in (34, 50, 64) if bykt[kt]]
+
+
 def fetch_storm_geometry(storm):
     """Fetch + parse one storm's forecast (and best-track) GIS. Blocking."""
     fz = _adv_zip_url(storm)
@@ -605,4 +648,10 @@ def fetch_storm_geometry(storm):
         fdata["windForecast"] = fetch_wind_forecast(storm)
     except Exception:
         fdata["windForecast"] = []
+    # Wind swath (drawn corridor along the track), assembled from the two above +
+    # the forecast points. Same normalized schema GDACS emits. Soft-fails to [].
+    try:
+        fdata["windSwath"] = build_wind_swath(fdata, storm)
+    except Exception:
+        fdata["windSwath"] = []
     return fdata
