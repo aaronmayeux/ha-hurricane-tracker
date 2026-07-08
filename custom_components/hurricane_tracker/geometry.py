@@ -662,12 +662,15 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
                        budget=ZOOM_POINT_BUDGET,
                        cap_bytes=ZOOM_PAYLOAD_CAP_BYTES)
 
-    # Region labels whose anchor falls in the DEFAULT frame; the card decides what
-    # to draw and hides any that would collide with storm data. (Overlays are only
-    # valid at the default frame -- they hide on zoom -- so anchor selection stays
-    # keyed to bbox, not the buffered viewBox.)
+    # Region labels whose anchor falls anywhere in the BUFFERED viewBox (E6: the
+    # card's zoom-aware label engine re-places labels at the current view, so
+    # panning into the buffer must have anchors to reveal; the card filters to
+    # the visible frame per view). Longitude is also tested +/-360 so an
+    # antimeridian-wrapped window still matches anchors stored in -180..180.
     labels = [r for r in REGION_LABELS
-              if bbox[0] <= r["lng"] <= bbox[2] and bbox[1] <= r["lat"] <= bbox[3]]
+              if view_box[1] <= r["lat"] <= view_box[3]
+              and any(view_box[0] <= lng <= view_box[2]
+                      for lng in (r["lng"], r["lng"] + 360, r["lng"] - 360))]
 
     # City dots (E3): places inside the BUFFERED viewBox (they live in the
     # geographic hu-pan group, so panning reveals them like the coastline),

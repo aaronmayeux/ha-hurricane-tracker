@@ -303,44 +303,79 @@ function pointInPoly(x, y, poly) {
   return inside;
 }
 
-/* Region name labels (country/state). Drawn under the storm data; any that would
- * touch a keep-out box (forecast dots, time labels, home marker) or sit inside
- * the cone are nudged to nearby open water, and only dropped if no clear spot is
- * found. Tier 1 (states) shows only when zoomed in enough. Region-agnostic:
- * whatever is in `src` gets considered. */
+/* ---- E6 zoom-aware label engine -------------------------------------------
+ * Region names + city labels are GEOGRAPHIC (they ride hu-pan and pan with the
+ * map) but their text must hold a constant on-screen size and their collision/
+ * visibility must be decided at the CURRENT view, not the default frame. Each
+ * label is its own <g class="hu-zl"> anchored at its geographic point with a
+ * counter-scale: translate(ax,ay) scale(1/s). The gesture layer updates that
+ * counter-scale every frame (cheap) and re-runs this layout pass ~150 ms after
+ * the view settles (collision, tier gating, reveal-on-pan). Screen position of
+ * any default-frame px point under the view (s,tx,ty) is simply s*p+t, so the
+ * keep-out boxes of the geographic storm furniture (forecast dots + their time
+ * labels) and the cone polygon transform affinely. Screen-space overlay boxes
+ * (home marker, model legend) apply only at the default frame -- the overlays
+ * are hidden everywhere else. */
 const REGION_CHAR_W = 7.4;
 /* Nudge offsets tried in order (px). Anchor first, then toward open water nearby. */
 const REGION_NUDGES = [[0, 0], [0, 15], [0, -15], [16, 0], [-16, 0], [0, 28], [0, -28], [22, 14], [-22, 14], [22, -14], [-22, -14], [0, 42], [0, -42]];
-function regionLabels(src, proj, bbox, keepOut, conePx) {
-  if (!src || !src.length) return [];
-  const span = Math.max(bbox[2] - bbox[0], bbox[3] - bbox[1]);
-  const maxTier = span > 16 ? 0 : 1;
-  const placed = [], out = [];
+function layoutZoomLabels(ctx, view) {
+  const s = view.s || 1, tx = view.tx || 0, ty = view.ty || 0;
+  const T = (x, y) => [s * x + tx, s * y + ty];
+  const keep = ctx.keepGeo.map((b) =>
+    ({ x1: s * b.x1 + tx, y1: s * b.y1 + ty, x2: s * b.x2 + tx, y2: s * b.y2 + ty }));
+  const atDefault = s <= 1.001 && s >= 0.999 && Math.abs(tx) < 0.5 && Math.abs(ty) < 0.5;
+  if (atDefault) keep.push(...ctx.keepScreen);
+  const conePx = ctx.conePx.map(([x, y]) => T(x, y));
+  const k = (1 / s).toFixed(4);
+  const zl = (ax, ay, inner) =>
+    `<g class="hu-zl" data-ax="${ax.toFixed(1)}" data-ay="${ay.toFixed(1)}" transform="translate(${ax.toFixed(1)} ${ay.toFixed(1)}) scale(${k})">${inner}</g>`;
+
+  // Region names: tier gate on the EFFECTIVE span (zooming in reveals states),
+  // anchor must be on the current frame (panning into the buffer reveals more),
+  // then the same nudge-to-open-water pass as ever -- all in screen space.
+  const placed = [], regions = [];
+  const maxTier = (ctx.span / s) > 16 ? 0 : 1;
   const clear = (box) => {
     if (box.x1 < 22 || box.x2 > VBW - 22 || box.y1 < 14 || box.y2 > VBH - 14) return false;
     const my = (box.y1 + box.y2) / 2;
-    if (conePx.length >= 3 && [box.x1 + 2, (box.x1 + box.x2) / 2, box.x2 - 2].some((tx) => pointInPoly(tx, my, conePx))) return false;
-    if (keepOut.some((b) => boxHit(box, b))) return false;
+    if (conePx.length >= 3 && [box.x1 + 2, (box.x1 + box.x2) / 2, box.x2 - 2].some((px) => pointInPoly(px, my, conePx))) return false;
+    if (keep.some((b) => boxHit(box, b))) return false;
     if (placed.some((b) => boxHit(box, b))) return false;
     return true;
   };
-  for (const r of src) {
+  for (const r of ctx.regions) {
     if (r.tier > maxTier) continue;
-    const [ax, ay] = proj(r.lng, r.lat);
-    if (ax < 24 || ax > VBW - 24 || ay < 18 || ay > VBH - 18) continue;   // anchor must be on-frame
-    const name = String(r.name).toUpperCase();
-    const w = name.length * REGION_CHAR_W;
+    const [sax, say] = T(r.ax, r.ay);
+    if (sax < 24 || sax > VBW - 24 || say < 18 || say > VBH - 18) continue;   // anchor must be on-frame
     let hit = null;
     for (const [dx, dy] of REGION_NUDGES) {
-      const x = ax + dx, y = ay + dy;
-      const box = { x1: x - w / 2 - 4, y1: y - 9, x2: x + w / 2 + 4, y2: y + 9 };
+      const x = sax + dx, y = say + dy;
+      const box = { x1: x - r.w / 2 - 4, y1: y - 9, x2: x + r.w / 2 + 4, y2: y + 9 };
       if (clear(box)) { hit = { x, y, box }; break; }   // nudge to open water rather than drop
     }
     if (!hit) continue;
     placed.push(hit.box);
-    out.push(`<text class="hu-region" x="${hit.x.toFixed(1)}" y="${(hit.y + 4).toFixed(1)}">${esc(name)}</text>`);
+    regions.push(zl(r.ax, r.ay,
+      `<text class="hu-region" x="${(hit.x - sax).toFixed(1)}" y="${(hit.y - say + 4).toFixed(1)}">${esc(r.name)}</text>`));
   }
-  return out;
+
+  // City dots + labels: dots always draw (constant on-screen size); text thins
+  // on a 64 px min-gap at the CURRENT view, biggest population first, and only
+  // cities on or near the current frame compete for a label slot (an off-frame
+  // metro no longer suppresses an on-frame town's name).
+  const taken = [], cities = [];
+  for (const p of ctx.cities) {
+    const [sx, sy] = T(p.x, p.y);
+    let txt = "";
+    if (sx > -40 && sx < VBW + 40 && sy > -40 && sy < VBH + 40
+        && !taken.some((t) => Math.hypot(t[0] - sx, t[1] - sy) < 64)) {
+      taken.push([sx, sy]);
+      txt = `<text class="hu-city-label" x="6" y="3.5">${esc(p.name)}</text>`;
+    }
+    cities.push(zl(p.x, p.y, `<circle class="hu-city" r="2.6"/>` + txt));
+  }
+  return { regions: regions.join(""), cities: cities.join("") };
 }
 
 /* nearest "nice" mile interval giving roughly `want` px between ticks */
@@ -430,24 +465,24 @@ function buildConeSvg(st, cfg, models) {
       if (d) windLayer.push(`<path class="hu-wind" style="fill:${windBandColor(w.kt)}" d="${d}"/>`);
     }
 
-  // E3 city dots: geographic reference furniture, so they ride hu-pan and
-  // pan/zoom with the map like the coastline (labels scale with zoom --
-  // accepted until a zoom-aware label engine exists, see spec horizon).
-  // Payload arrives biggest-population first and capped server-side; a greedy
-  // min-gap pass (at the default frame) drops labels that would pile up in a
-  // metro-dense frame -- the dots stay, only the text thins. Drawn under the
-  // storm data on purpose: official geometry always wins.
-  const cities = [];
-  if (cfg.show_cities !== false && st.places && st.places.length) {
-    const taken = [];
+  // E6: cities and region names are placed by the zoom-aware label engine
+  // (layoutZoomLabels). Here we only compute their pan-local anchor px once;
+  // the engine decides dot/text emission per view. Longitudes are normalized
+  // into the map's 360-degree window (home-marker trick) so a wrapped frame
+  // still places anchors the short way round.
+  const cLng0 = (st.bbox[0] + st.bbox[2]) / 2;
+  const normLng = (lng) => {
+    let x = lng;
+    while (x - cLng0 > 180) x -= 360;
+    while (x - cLng0 < -180) x += 360;
+    return x;
+  };
+  const ctxCities = [];
+  if (cfg.show_cities !== false && st.places && st.places.length)
     for (const p of st.places) {
-      const [x, y] = proj(p.lng, p.lat);
-      cities.push(`<circle class="hu-city" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"/>`);
-      if (taken.some((t) => Math.hypot(t[0] - x, t[1] - y) < 64)) continue;
-      taken.push([x, y]);
-      cities.push(`<text class="hu-city-label" x="${(x + 6).toFixed(1)}" y="${(y + 3.5).toFixed(1)}">${esc(p.name)}</text>`);
+      const [x, y] = proj(normLng(p.lng), p.lat);
+      ctxCities.push({ name: p.name, x, y });
     }
-  }
 
   const storm = [];
   for (const seg of st.ww || []) {
@@ -483,7 +518,8 @@ function buildConeSvg(st, cfg, models) {
     }
   }
 
-  const keepOut = [];
+  const keepOut = [];      // GEOGRAPHIC keep-out boxes (forecast dots + time labels): transform affinely with the view
+  const keepScreen = [];   // screen-space overlay boxes (home marker, model legend): only valid at the default frame
   const labelJobs = [];
   const projPts = (st.points || []).map((p) => (p.lng == null || p.lat == null) ? null : proj(p.lng, p.lat));
   (st.points || []).forEach((p, i) => {
@@ -519,7 +555,7 @@ function buildConeSvg(st, cfg, models) {
     const [hx, hy] = proj(hlng, st.home[1]);
     if (hx >= 0 && hx <= VBW && hy >= 0 && hy <= VBH) {
       homeParts.push(houseGlyph(hx, hy));
-      keepOut.push({ x1: hx - 20, y1: hy - 20, x2: hx + 20, y2: hy + 20 });
+      keepScreen.push({ x1: hx - 20, y1: hy - 20, x2: hx + 20, y2: hy + 20 });
     } else {
       // Off-frame: clamp the house to the edge at home's projected position; the
       // chevron points from the house center straight at home.
@@ -533,7 +569,7 @@ function buildConeSvg(st, cfg, models) {
       const inX = hcx - ux * 160, inY = hcy - uy * 160;   // inboard (label) reach
       const outX = hcx + ux * 34, outY = hcy + uy * 34;   // outboard (arrow) reach
       const P = 22;
-      keepOut.push({
+      keepScreen.push({
         x1: Math.min(inX, outX, hcx) - P, y1: Math.min(inY, outY, hcy) - P,
         x2: Math.max(inX, outX, hcx) + P, y2: Math.max(inY, outY, hcy) + P,
       });
@@ -560,31 +596,56 @@ function buildConeSvg(st, cfg, models) {
       if (col) mlegend.push(`<line class="hu-mlegend-sw" x1="${x0 + padX}" y1="${cy.toFixed(1)}" x2="${x0 + padX + 18}" y2="${cy.toFixed(1)}" stroke="${col}"/>`);
       mlegend.push(`<text class="hu-mlegend-t" x="${x0 + padX + (col ? 24 : 0)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
     });
-    keepOut.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+    keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
   }
 
   const conePx = (st.cone || []).map((c) => proj(c[0], c[1]));
-  const region = cfg.show_labels !== false ? regionLabels(st.labels, proj, st.bbox, keepOut, conePx) : [];
-  const scale = (farCase && cfg.show_scale !== false) ? scaleAxes(st.bbox, proj, st.geo, keepOut, conePx, hcx, hcy) : [];
+  const scale = (farCase && cfg.show_scale !== false)
+    ? scaleAxes(st.bbox, proj, st.geo, keepOut.concat(keepScreen), conePx, hcx, hcy) : [];
+
+  // E6 label-engine context: everything layoutZoomLabels needs to re-place the
+  // region/city labels at ANY view, precomputed in default-frame px. Region
+  // anchors come from the whole BUFFERED payload (panning reveals them); the
+  // engine's on-frame test decides visibility per view.
+  const ctxRegions = [];
+  if (cfg.show_labels !== false)
+    for (const r of st.labels || []) {
+      const name = String(r.name).toUpperCase();
+      const [ax, ay] = proj(normLng(r.lng), r.lat);
+      ctxRegions.push({ name, w: name.length * REGION_CHAR_W, ax, ay, tier: r.tier || 0 });
+    }
+  const ctx = {
+    span: Math.max(st.bbox[2] - st.bbox[0], st.bbox[3] - st.bbox[1]),
+    regions: ctxRegions, cities: ctxCities,
+    keepGeo: keepOut, keepScreen, conePx,
+  };
+  const zl0 = layoutZoomLabels(ctx, { s: 1, tx: 0, ty: 0 });
 
   // Two sibling groups. hu-pan holds the GEOGRAPHIC layers (basemap, wind wash,
   // cone/track/dots/ww + on-dot labels) -- these scale honestly, so pan/zoom is a
-  // transform on this group alone. hu-overlays holds SCREEN-SPACE furniture (region
-  // names, off-screen home marker, offshore mileage scale) whose edge-clamp/keepOut
-  // math is only valid at the default frame; it hides whenever the view leaves default
-  // (set by the gesture layer) and returns on recenter. The outer viewBox is always
-  // the default 800x600 frame; the buffered coastline in `geo` extends past it and is
-  // simply clipped until a gesture reveals it. viewBox/maxScale ride as data-attrs so
-  // the gesture layer can read the pannable extent + zoom ceiling off the DOM.
-  const panGroup = [...base, ...windLayer, ...cities, ...storm];
-  const overlayGroup = [...region, ...scale, ...homeParts, ...mlegend];
+  // transform on this group alone. The E6 label groups live in hu-pan too: cities
+  // UNDER the storm data, region names ABOVE it (same stacking as before), each a
+  // counter-scaled .hu-zl group the gesture layer maintains per frame. hu-overlays
+  // keeps the true screen-space furniture (off-screen home marker, offshore mileage
+  // scale, model legend) whose edge-clamp math is only valid at the default frame;
+  // it hides whenever the view leaves default and returns on recenter. The outer
+  // viewBox is always the default 800x600 frame; the buffered coastline in `geo`
+  // extends past it and is simply clipped until a gesture reveals it. viewBox/
+  // maxScale ride as data-attrs so the gesture layer can read the pannable extent
+  // + zoom ceiling off the DOM. Returns {svg, ctx}: the card stashes ctx for the
+  // engine's re-runs.
+  const panGroup = [...base, ...windLayer,
+    `<g class="hu-zl-cities">${zl0.cities}</g>`, ...storm,
+    `<g class="hu-zl-regions">${zl0.regions}</g>`];
+  const overlayGroup = [...scale, ...homeParts, ...mlegend];
   const vb = st.viewBox ? st.viewBox.join(" ") : "";
   const ms = st.maxScale != null ? st.maxScale : 1;
-  return `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
+  const svg = `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
     + ` data-viewbox="${vb}" data-maxscale="${ms}" data-bbox="${(st.bbox || []).join(" ")}" xmlns="http://www.w3.org/2000/svg">`
     + `<g class="hu-pan">${panGroup.join("")}</g>`
     + `<g class="hu-overlays">${overlayGroup.join("")}</g>`
     + `</svg>`;
+  return { svg, ctx };
 }
 
 function dataBar(st) {
@@ -994,7 +1055,12 @@ class HurricaneCard extends HTMLElement {
         else { modelState = { loading: true }; this._fetchModels(mkey, st.stormId || ""); }
       }
       let svg = "";
-      try { svg = buildConeSvg(st, cfg, modelState); }
+      this._labelCtx = null;   // E6: engine context, set only on a successful build
+      try {
+        const built = buildConeSvg(st, cfg, modelState);
+        svg = built.svg;
+        this._labelCtx = built.ctx;
+      }
       catch (e) { svg = this._msg("mdi:map-marker-alert", "Couldn\u2019t draw this storm", "", false); }
       // Map chrome: recenter (zoom), the advisory doc button (only when that
       // layer is on), and the gear that opens the layers panel. The panel lists
@@ -1096,6 +1162,8 @@ class HurricaneCard extends HTMLElement {
    * overlays hide off-default and return on recenter. */
   _setupPanZoom() {
     const svg = this.shadowRoot.querySelector(".hu-svg");
+    // E6: a pending label re-layout belongs to the previous render's DOM.
+    if (this._zlTimer) { clearTimeout(this._zlTimer); this._zlTimer = null; }
     // Decide reset vs restore ONCE per render, then clear the one-shot flag. Reset
     // when: an explicit storm switch (pager set _resetView), or the shown storm's
     // id differs from the one the saved view belongs to (storm changed under us).
@@ -1145,6 +1213,30 @@ class HurricaneCard extends HTMLElement {
     const view = saved ? { s: saved.s, tx: saved.tx, ty: saved.ty } : { s: 1, tx: 0, ty: 0 };
     this._view = view;
     this._viewStormId = stormId;
+
+    // E6 zoom-aware label engine wiring. Labels are counter-scaled .hu-zl groups
+    // inside hu-pan: every frame apply() updates their scale(1/s) so text holds a
+    // constant on-screen size while riding the map; the full collision/visibility
+    // layout (layoutZoomLabels) re-runs only once the view settles (150 ms).
+    let zlNodes = [];
+    const cacheZl = () => {
+      zlNodes = [];
+      svg.querySelectorAll("g.hu-zl").forEach((el) => {
+        zlNodes.push({ el, ax: el.getAttribute("data-ax"), ay: el.getAttribute("data-ay") });
+      });
+    };
+    const runLabels = () => {
+      const ctx = this._labelCtx;
+      if (!ctx) return;
+      const out = layoutZoomLabels(ctx, { s: view.s, tx: view.tx, ty: view.ty });
+      const gr = svg.querySelector(".hu-zl-regions");
+      const gc = svg.querySelector(".hu-zl-cities");
+      if (gr) gr.innerHTML = out.regions;
+      if (gc) gc.innerHTML = out.cities;
+      cacheZl();
+    };
+    cacheZl();
+
     let raf = 0;
     const EPS = 0.001;
     const isDefault = () => view.s <= 1 + EPS && view.s >= 1 - EPS
@@ -1170,6 +1262,13 @@ class HurricaneCard extends HTMLElement {
       raf = 0;
       clamp();   // enforce hard bounds before every paint -- nothing illegal renders
       pan.setAttribute("transform", `translate(${view.tx.toFixed(2)} ${view.ty.toFixed(2)}) scale(${view.s.toFixed(4)})`);
+      // E6: hold every label at constant on-screen size through the gesture,
+      // then re-run the collision layout once the view stops moving.
+      const zk = (1 / view.s).toFixed(4);
+      for (const n of zlNodes)
+        n.el.setAttribute("transform", `translate(${n.ax} ${n.ay}) scale(${zk})`);
+      if (this._zlTimer) clearTimeout(this._zlTimer);
+      this._zlTimer = setTimeout(runLabels, 150);
       const def = isDefault();
       overlays && overlays.classList.toggle("hu-hide", !def);
       btn && btn.classList.toggle("hu-show", !def);
