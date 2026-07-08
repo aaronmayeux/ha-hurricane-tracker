@@ -76,7 +76,7 @@ const COLOR_VARS = {
   background_color: "--hu-bg",
 };
 /* Layer toggles (default on). */
-const TOGGLES = ["show_land", "show_states", "show_coast", "show_labels", "show_scale", "show_home", "show_winds", "show_timeline", "smooth"];
+const TOGGLES = ["show_land", "show_states", "show_coast", "show_cities", "show_labels", "show_scale", "show_home", "show_winds", "show_timeline", "smooth"];
 
 function catDotLabel(c) {
   const k = String(c || "").toUpperCase();
@@ -418,6 +418,25 @@ function buildConeSvg(st, cfg) {
       if (d) windLayer.push(`<path class="hu-wind" style="fill:${windBandColor(w.kt)}" d="${d}"/>`);
     }
 
+  // E3 city dots: geographic reference furniture, so they ride hu-pan and
+  // pan/zoom with the map like the coastline (labels scale with zoom --
+  // accepted until a zoom-aware label engine exists, see spec horizon).
+  // Payload arrives biggest-population first and capped server-side; a greedy
+  // min-gap pass (at the default frame) drops labels that would pile up in a
+  // metro-dense frame -- the dots stay, only the text thins. Drawn under the
+  // storm data on purpose: official geometry always wins.
+  const cities = [];
+  if (cfg.show_cities !== false && st.places && st.places.length) {
+    const taken = [];
+    for (const p of st.places) {
+      const [x, y] = proj(p.lng, p.lat);
+      cities.push(`<circle class="hu-city" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"/>`);
+      if (taken.some((t) => Math.hypot(t[0] - x, t[1] - y) < 64)) continue;
+      taken.push([x, y]);
+      cities.push(`<text class="hu-city-label" x="${(x + 6).toFixed(1)}" y="${(y + 3.5).toFixed(1)}">${esc(p.name)}</text>`);
+    }
+  }
+
   const storm = [];
   for (const seg of st.ww || []) {
     const col = wwColor(seg.type);
@@ -502,7 +521,7 @@ function buildConeSvg(st, cfg) {
   // the default 800x600 frame; the buffered coastline in `geo` extends past it and is
   // simply clipped until a gesture reveals it. viewBox/maxScale ride as data-attrs so
   // the gesture layer can read the pannable extent + zoom ceiling off the DOM.
-  const panGroup = [...base, ...windLayer, ...storm];
+  const panGroup = [...base, ...windLayer, ...cities, ...storm];
   const overlayGroup = [...region, ...scale, ...homeParts];
   const vb = st.viewBox ? st.viewBox.join(" ") : "";
   const ms = st.maxScale != null ? st.maxScale : 1;
@@ -692,6 +711,9 @@ const STYLE = `
   .hu-region { font: 600 12px/1 sans-serif; letter-spacing: .1em; text-transform: uppercase;
                text-anchor: middle; fill: var(--hu-region-color, var(--secondary-text-color)); opacity: .5;
                paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
+  .hu-city { fill: var(--secondary-text-color); opacity: .75; }
+  .hu-city-label { font: 500 9.5px/1 sans-serif; fill: var(--secondary-text-color); opacity: .75;
+                   paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 2.5px; }
   .hu-scale-tick { stroke: var(--secondary-text-color); stroke-width: 1.5; opacity: .55; }
   .hu-scale-label { font: 600 11px/1 sans-serif; fill: var(--secondary-text-color); opacity: .7;
                     paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
@@ -1153,6 +1175,7 @@ const EDITOR_FIELDS = [
   { key: "show_land", label: "Show land fill", type: "bool", def: true },
   { key: "show_coast", label: "Show coastlines", type: "bool", def: true },
   { key: "show_states", label: "Show state/province lines", type: "bool", def: true },
+  { key: "show_cities", label: "Show city dots", type: "bool", def: true },
   { key: "show_labels", label: "Show region labels", type: "bool", def: true },
   { key: "show_scale", label: "Show offshore mileage scale", type: "bool", def: true },
   { key: "show_home", label: "Show home marker", type: "bool", def: true },

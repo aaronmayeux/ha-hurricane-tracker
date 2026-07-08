@@ -19,6 +19,7 @@ import struct
 
 from .const import (
     BASIN_NAME,
+    CITY_DOT_CAP,
     UNIT_KM,
     ZOOM_BUFFER_FACTOR,
     ZOOM_MAX_SCALE,
@@ -43,7 +44,8 @@ _MIN_PTS = {"coast": 2, "states": 2, "land": 3}
 
 
 # ---------------------------------------------------------------------------
-# Basemap (packed binary) reader — HURB v2, matches tools/pack_basemap.py
+# Basemap (packed binary) reader — HURB v2/v3, matches tools/pack_basemap.py
+# (v3 adds a 4th POINT layer, populated places; a v2 file just has no places)
 # ---------------------------------------------------------------------------
 class _Basemap:
     """Lazy reader over the packed basemap. Holds the raw bytes plus a per-part
@@ -53,8 +55,8 @@ class _Basemap:
         if buf[:4] != b"HURB":
             raise ValueError("bad basemap magic")
         ver, self.quant, nlayers = struct.unpack_from("<III", buf, 4)
-        if ver != 2:
-            raise ValueError("unsupported basemap version %d (need 2)" % ver)
+        if ver not in (2, 3):
+            raise ValueError("unsupported basemap version %d (need 2 or 3)" % ver)
         self.buf = buf
         p = 16
         dirs = []
@@ -64,6 +66,20 @@ class _Basemap:
             dirs.append((off, ln))
         # index[layer] = list of (minx, miny, maxx, maxy, points_offset, npts)
         self.index = {}
+        # places = list of (x, y, rank, pop, name) in quantized ints; decoded
+        # eagerly at load (a few thousand small records — one-time, cheap).
+        self.places = []
+        if ver >= 3 and len(dirs) >= 4:
+            cur = dirs[3][0]
+            nplaces = struct.unpack_from("<I", buf, cur)[0]
+            cur += 4
+            rec = struct.calcsize("<iiBIB")   # 14: no alignment padding with "<"
+            for _ in range(nplaces):
+                x, y, rank, pop, nlen = struct.unpack_from("<iiBIB", buf, cur)
+                cur += rec
+                name = buf[cur:cur + nlen].decode("utf-8", "replace")
+                cur += nlen
+                self.places.append((x, y, rank, pop, name))
         for name, (off, _ln) in zip(_LAYER_NAMES, dirs):
             parts = []
             cur = off
@@ -102,6 +118,25 @@ class _Basemap:
             if a > mxx or c < mnx or b > mxy or d < mny:
                 continue
             out.append(self._decode(poff, npts))
+        return out
+
+    def places_in(self, bbox, pad=0.0):
+        """Populated places inside the (padded) box, as dicts. Same quantized
+        bbox compare as clip() — no antimeridian wrap, matching the line layers.
+        Empty on a v2 basemap."""
+        if not self.places:
+            return []
+        q = self.quant
+        mnx = int((bbox[0] - pad) * q)
+        mny = int((bbox[1] - pad) * q)
+        mxx = int((bbox[2] + pad) * q)
+        mxy = int((bbox[3] + pad) * q)
+        out = []
+        for (x, y, rank, pop, name) in self.places:
+            if x < mnx or x > mxx or y < mny or y > mxy:
+                continue
+            out.append({"name": name, "lng": x / q, "lat": y / q,
+                        "rank": rank, "pop": pop})
         return out
 
 
@@ -634,6 +669,15 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     labels = [r for r in REGION_LABELS
               if bbox[0] <= r["lng"] <= bbox[2] and bbox[1] <= r["lat"] <= bbox[3]]
 
+    # City dots (E3): places inside the BUFFERED viewBox (they live in the
+    # geographic hu-pan group, so panning reveals them like the coastline),
+    # biggest population first, capped so a metro-dense frame stays light. The
+    # card handles label declutter; a v2 basemap yields [] and nothing draws.
+    places = sorted(basemap.places_in(view_box), key=lambda p: -p["pop"])[:CITY_DOT_CAP]
+    places = [{"name": p["name"], "lng": round(p["lng"], 4),
+               "lat": round(p["lat"], 4), "pop": p["pop"], "rank": p["rank"]}
+              for p in places]
+
     cur_lat = storm.get("latitudeNumeric")
     cur_lng = storm.get("longitudeNumeric")
     dist_mi = (haversine_mi(home_lat, home_lon, cur_lat, cur_lng)
@@ -778,5 +822,6 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "windField": built_wind,
         "geo": geo,
         "labels": labels,
+        "places": places,
         "meta": meta,
     }

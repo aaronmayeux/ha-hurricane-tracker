@@ -109,6 +109,7 @@ show_scale: false
 | `show_land` | Land fill. |
 | `show_coast` | Coastlines. |
 | `show_states` | State/province border lines. |
+| `show_cities` | City dots + names (populated places from Natural Earth, biggest first). |
 | `show_labels` | Region/country name labels. |
 | `show_scale` | Far-offshore mileage scale (only appears when home is off-frame). |
 | `show_home` | Home marker. |

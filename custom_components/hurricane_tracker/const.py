@@ -153,6 +153,7 @@ ZOOM_BUFFER_FACTOR = 2.0     # buffered extent = this * the default frame, about
 ZOOM_POINT_BUDGET = 20000    # simplification ceiling for the buffered clip (a cap, not a target)
 ZOOM_PAYLOAD_CAP_BYTES = 400000  # hard cap on the serialized geo; back off tolerance until under
 ZOOM_MAX_SCALE = 3.0         # card zoom-in limit (past this the DP coastline reads chunky)
+CITY_DOT_CAP = 30            # max city dots per payload (top-N by pop_max in the buffered view)
 
 # --- frontend ---------------------------------------------------------------
 CARD_FILENAME = "hurricane-card.js"
