@@ -745,7 +745,11 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
             ring = _corridor_ring(_order_along_track(tier["points"], cur_lng, cur_lat))
         if ring and len(ring) >= 3:
             built_swath.append({"kt": tier["kt"], "rings": [ring]})
-    built_wind = built_swath if built_swath else built_current
+    # Current field and full-track swath are BOTH emitted now (windField +
+    # windSwath). The card picks which to draw per the `wind_swath` toggle
+    # (default: current position). GDACS's swath already spans the whole track
+    # (past included), so "full swath" doubles as its wind-history footprint; the
+    # current trio is the singular 34/50/64 field at the storm's present center.
 
     cpa_mi, cpa_hours = _closest_approach(points, home_lat, home_lon, cur_lat, cur_lng)
     cpa_eye_val = _dist_conv(cpa_mi)   # center/eye basis, kept for the Phase 4 dot
@@ -822,7 +826,8 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "pastTrack": past,
         "points": points,
         "ww": fdata.get("ww") or [],
-        "windField": built_wind,
+        "windField": built_current,
+        "windSwath": built_swath,
         "geo": geo,
         "labels": labels,
         "places": places,

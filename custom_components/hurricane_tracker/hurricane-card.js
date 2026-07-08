@@ -29,6 +29,10 @@ const VBW = 800, VBH = 600;
 const OPTIONAL_LAYERS = [
   { id: "advisory", label: "Advisory text", group: "Storm info", radio: null },
   { id: "models", label: "Forecast model tracks", group: "Storm info", radio: null, nhcOnly: true },
+  // Client-only render toggle (no fetch): wind data is already in the bake. OFF
+  // (default) = the singular current-position 34/50/64 field; ON = the full-track
+  // swath (GDACS's whole-track envelope / NHC's forecast corridor).
+  { id: "wind_swath", label: "Full-track wind swath", group: "Wind field", radio: null },
 ];
 /* NHC storm ids are basin-prefixed (al/ep/cp + number + year); GDACS ids are
  * bare event numbers. Gates the NHC-only layers (model tracks). */
@@ -431,7 +435,8 @@ function scaleAxes(bbox, proj, geo, keepOut, conePx, hcx, hcy) {
 }
 
 /* ---- build the SVG from one baked storm payload --------------------------- */
-function buildConeSvg(st, cfg, models) {
+function buildConeSvg(st, cfg, models, prefs) {
+  prefs = prefs || {};
   const proj = makeProject(st.bbox);
   const smooth = cfg.smooth !== false;
   const base = [];
@@ -453,8 +458,16 @@ function buildConeSvg(st, cfg, models) {
   // round those into organic curves. This keeps the lopsided extents intact --
   // smoothing, not circularizing.
   const windLayer = [];
-  if (cfg.show_winds !== false && st.windField && st.windField.length)
-    for (const w of st.windField) {
+  // Wind source: the singular current-position 34/50/64 field by default; the
+  // full-track swath when `wind_swath` is on. GDACS's swath spans the whole track
+  // (past + forecast), so it doubles as the wind-history footprint; the current
+  // field is just the present center. Fall back to whichever exists so a storm
+  // that only has one of the two still draws.
+  let windSrc = st.windField;
+  if (prefs.wind_swath && st.windSwath && st.windSwath.length) windSrc = st.windSwath;
+  else if ((!windSrc || !windSrc.length) && st.windSwath && st.windSwath.length) windSrc = st.windSwath;
+  if (cfg.show_winds !== false && windSrc && windSrc.length)
+    for (const w of windSrc) {
       // Union the tier's rings into ONE path so the blobs along the track merge into
       // a single uniform fill (nonzero winding) -- no darker seams where they overlap.
       // One blob (current-position field) or many (the wind swath) both work here.
@@ -1057,7 +1070,7 @@ class HurricaneCard extends HTMLElement {
       let svg = "";
       this._labelCtx = null;   // E6: engine context, set only on a successful build
       try {
-        const built = buildConeSvg(st, cfg, modelState);
+        const built = buildConeSvg(st, cfg, modelState, prefs);
         svg = built.svg;
         this._labelCtx = built.ctx;
       }
