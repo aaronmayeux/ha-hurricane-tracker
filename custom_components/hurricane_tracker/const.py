@@ -121,6 +121,33 @@ WIND_ADVISORY_OFFSET = 13   # "<slot> Advisory Wind Field" = current radii
 WIND_FORECAST_OFFSET = 12
 WIND_RADII_KTS = (34, 50, 64)
 
+# --- forecast model tracks (E4, NHC-only; on-demand layer) -------------------
+# Guidance ("spaghetti") tracks from the NHC ATCF a-deck for the storm, served
+# over the layer websocket ONLY when the viewer toggles the layer on -- never in
+# the 30-min bake. Capped shortlist: the point is spread, not a model zoo.
+# aid_public serves the CURRENT season's decks over HTTPS (same host also does
+# FTP; we use HTTPS via the stock http_get). EMXI (ECMWF) is access-restricted
+# in public decks (rows blank) -- excluded on purpose. GFS is AVNO (not GFSO);
+# UKMET is UKX (not EGRR). Verified against a live a-deck aep012026, 2026-07.
+ADECK_URL = "https://ftp.nhc.noaa.gov/atcf/aid_public/a%s.dat.gz"
+# Ordered (tech, human label). TVCN and HCCA are both consensus aids: TVCN is
+# preferred, HCCA is the fallback when TVCN is absent (handled in nhc.py).
+MODEL_TRACK_TECHS = (
+    ("OFCL", "NHC Official"),
+    ("TVCN", "Consensus"),
+    ("HCCA", "Consensus"),
+    ("AVNO", "GFS"),
+    ("HFSA", "HAFS-A"),
+    ("UKX", "UKMET"),
+)
+MODEL_TRACK_MAX_TAU = 168     # hours; past 7 days guidance is noise
+MODEL_TRACK_MAX_PTS = 32      # per-model point cap (taus are 6-12 h apart)
+# A tech's own latest cycle must be within this many hours of the deck's newest
+# cycle or the tech is dropped -- late/raw models lag one cycle behind OFCL, so
+# per-tech-latest keeps them on the map, but a model that stopped running
+# entirely must not draw a days-old track.
+MODEL_TRACK_STALE_H = 12
+
 # --- past-track trail -------------------------------------------------------
 # Miles of TRAVEL kept behind the storm, so a fast and a slow storm trail the
 # same physical length on screen (consistent zoom).

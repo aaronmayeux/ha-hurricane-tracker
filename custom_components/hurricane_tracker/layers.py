@@ -26,7 +26,8 @@ from . import nhc
 _LOGGER = logging.getLogger(__name__)
 
 LAYER_ADVISORY = "advisory"
-LAYERS = {LAYER_ADVISORY}
+LAYER_MODELS = "models"
+LAYERS = {LAYER_ADVISORY, LAYER_MODELS}
 
 # Cache cap. Keys are (storm_id, layer, advisory); texts are small, but don't
 # let a long multi-storm season accumulate stale advisories.
@@ -64,6 +65,29 @@ def _advisory_result(meta):
             "title": title, "text": text}
 
 
+def _models_result(storm_id, meta):
+    """Forecast model tracks (E4) for one NHC storm, from its ATCF a-deck.
+    NHC-only: GDACS has no per-model guidance (its track lines are one JTWC
+    track split by intensity), so a GDACS storm returns None -> the platform's
+    honest 'unavailable' (the card hides the toggle for GDACS anyway).
+    Blocking (HTTP) -> always called in an executor. None = nothing usable."""
+    if meta.get("source") == "gdacs":
+        return None
+    models = nhc.fetch_model_tracks(storm_id)
+    if not models:
+        return None
+    return {"ok": True, "layer": LAYER_MODELS,
+            "advisory": str(meta.get("advisory") or ""),
+            "models": models}
+
+
+def _build_result(layer, storm_id, meta):
+    """Dispatch: build one layer's result. Blocking; executor-only."""
+    if layer == LAYER_MODELS:
+        return _models_result(storm_id, meta)
+    return _advisory_result(meta)
+
+
 async def async_get_layer(hass, coordinator, storm_id, layer):
     """Serve one storm's optional layer: cache hit, else executor fetch.
     Always returns a dict; failures are {"ok": False, "reason": ...} so the
@@ -80,7 +104,8 @@ async def async_get_layer(hass, coordinator, storm_id, layer):
     if key in cache:
         return cache[key]
     try:
-        result = await hass.async_add_executor_job(_advisory_result, meta)
+        result = await hass.async_add_executor_job(
+            _build_result, layer, storm_id, meta)
     except Exception as err:
         _LOGGER.warning("hurricane_tracker: %s layer fetch failed for %s: %s",
                         layer, storm_id, err)

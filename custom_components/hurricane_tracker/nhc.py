@@ -20,6 +20,7 @@ import urllib.request
 import zipfile
 
 from .const import (
+    ADECK_URL,
     BASIN_ATLANTIC,
     BASIN_AUTO,
     BASIN_AUSTRALIAN,
@@ -35,6 +36,10 @@ from .const import (
     CURRENT_STORMS_URL,
     FILTER_ALL,
     HTTP_TIMEOUT,
+    MODEL_TRACK_MAX_PTS,
+    MODEL_TRACK_MAX_TAU,
+    MODEL_TRACK_STALE_H,
+    MODEL_TRACK_TECHS,
     PAST_MILES,
     USER_AGENT,
     WIND_ADVISORY_OFFSET,
@@ -655,6 +660,95 @@ def fetch_storm_geometry(storm):
     except Exception:
         fdata["windSwath"] = []
     return fdata
+
+
+# ---------------------------------------------------------------------------
+# Forecast model tracks (E4 layer; on-demand only, never in the bake)
+# ---------------------------------------------------------------------------
+# ATCF a-deck for the storm: gzipped comma-separated rows, one per
+# (cycle, tech, tau[, wind-radii threshold]). Columns used (0-based): 2 = DTG
+# (YYYYMMDDHH cycle), 4 = tech, 5 = tau, 6/7 = lat/lon (tenths of a degree with
+# a N/S/E/W suffix). A tau repeats across radii-threshold rows -- first row per
+# tau wins. Stdlib only, blocking: run in an executor.
+def _atcf_ll(tok):
+    """'286N' / '920W' -> signed degrees. None on junk."""
+    tok = (tok or "").strip()
+    if len(tok) < 2 or tok[-1] not in "NSEWnsew":
+        return None
+    try:
+        v = float(tok[:-1]) / 10.0
+    except ValueError:
+        return None
+    return -v if tok[-1] in "WwSs" else v
+
+
+def parse_model_tracks(text):
+    """a-deck text -> [{"id": tech, "label": .., "points": [[lng, lat], ..]}, ..]
+    in MODEL_TRACK_TECHS order. Per tech, the tech's OWN latest cycle is used
+    (raw models lag OFCL by a cycle), but only if it's within
+    MODEL_TRACK_STALE_H of the deck's newest cycle -- a model that stopped
+    running must not draw a days-old track. TVCN is the preferred consensus;
+    HCCA fills in only when TVCN is absent. Empty list on an empty/junk deck."""
+    wanted = {t for t, _ in MODEL_TRACK_TECHS}
+    # rows[tech][dtg][tau] = (lng, lat), first row per tau wins
+    rows = {}
+    for ln in (text or "").splitlines():
+        f = [c.strip() for c in ln.split(",")]
+        if len(f) < 9 or f[4] not in wanted:
+            continue
+        try:
+            tau = int(float(f[5]))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= tau <= MODEL_TRACK_MAX_TAU):
+            continue
+        lat, lng = _atcf_ll(f[6]), _atcf_ll(f[7])
+        if lat is None or lng is None or (lat == 0 and lng == 0):
+            continue
+        rows.setdefault(f[4], {}).setdefault(f[2], {}).setdefault(
+            tau, (round(lng, 2), round(lat, 2)))
+    if not rows:
+        return []
+    newest = max(dtg for percyc in rows.values() for dtg in percyc)
+
+    def _fresh(dtg):
+        # DTGs are fixed-width YYYYMMDDHH; hour distance via int subtraction is
+        # only safe same-day, so compare as timestamps.
+        from datetime import datetime
+        try:
+            a = datetime.strptime(newest, "%Y%m%d%H")
+            b = datetime.strptime(dtg, "%Y%m%d%H")
+        except ValueError:
+            return False
+        return (a - b).total_seconds() <= MODEL_TRACK_STALE_H * 3600
+
+    out = []
+    have_tvcn = "TVCN" in rows
+    for tech, label in MODEL_TRACK_TECHS:
+        if tech == "HCCA" and have_tvcn:
+            continue    # consensus slot already filled by TVCN
+        percyc = rows.get(tech)
+        if not percyc:
+            continue
+        dtg = max(percyc)
+        if not _fresh(dtg):
+            continue
+        taus = sorted(percyc[dtg])
+        pts = [list(percyc[dtg][t]) for t in taus][:MODEL_TRACK_MAX_PTS]
+        if len(pts) >= 2:
+            out.append({"id": tech, "label": label, "points": pts})
+    return out
+
+
+def fetch_model_tracks(storm_id):
+    """Fetch + parse the a-deck guidance tracks for one NHC storm. Blocking;
+    raises on network/parse failure (the layer platform soft-fails it)."""
+    import gzip
+    sid = (storm_id or "").lower().strip()
+    if not sid:
+        return []
+    raw = http_get(ADECK_URL % sid, binary=True)
+    return parse_model_tracks(gzip.decompress(raw).decode("utf-8", "replace"))
 
 
 # ---------------------------------------------------------------------------

@@ -117,6 +117,18 @@ show_scale: false
 | `show_timeline` | At-home wind timeline below the map (only appears when forecast winds reach home). |
 | `smooth` | Smooth (curved) coastlines vs. straight segments. |
 
+### Map layers (gear menu on the card)
+
+The gear button on the map opens per-viewer layers. These are off by default,
+sticky per browser, and fetch their data **only when switched on** — they never
+add to the integration's background polling, so the baseline card stays cheap
+on low-end hardware.
+
+| Layer | What it shows |
+|---|---|
+| Advisory text | The storm's full advisory / alert text in an overlay. |
+| Forecast model tracks | Guidance ("spaghetti") tracks from the NHC forecast models — NHC Official, consensus, GFS, HAFS-A, UKMET. Atlantic/East Pacific/Central Pacific storms only; other basins don't publish per-model tracks. |
+
 ### Colors and style (default = follow theme)
 
 | Option | Controls | In visual editor? |

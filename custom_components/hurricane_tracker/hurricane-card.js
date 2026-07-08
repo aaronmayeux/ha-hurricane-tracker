@@ -28,7 +28,19 @@ const VBW = 800, VBH = 600;
  * (paid once per advisory, not per glance). */
 const OPTIONAL_LAYERS = [
   { id: "advisory", label: "Advisory text", group: "Storm info", radio: null },
+  { id: "models", label: "Forecast model tracks", group: "Storm info", radio: null, nhcOnly: true },
 ];
+/* NHC storm ids are basin-prefixed (al/ep/cp + number + year); GDACS ids are
+ * bare event numbers. Gates the NHC-only layers (model tracks). */
+const isNhcId = (sid) => /^(al|ep|cp)\d/i.test(sid || "");
+/* E4 model-track identity colors (fixed hexes like the cat ramp -- a GFS line
+ * must read as GFS on any theme). HCCA shares TVCN's color: same consensus
+ * slot, never drawn together. */
+const MODEL_COLOR = {
+  OFCL: "#EDE3D2", TVCN: "#00E5FF", HCCA: "#00E5FF",
+  AVNO: "#B388FF", HFSA: "#FFAB40", UKX: "#F06292",
+};
+const modelColor = (id) => MODEL_COLOR[id] || "#9E9E9E";
 const LAYER_STORE_KEY = "hurricane-card:layers";
 function loadLayerPrefs() {
   try { return JSON.parse(localStorage.getItem(LAYER_STORE_KEY)) || {}; }
@@ -384,7 +396,7 @@ function scaleAxes(bbox, proj, geo, keepOut, conePx, hcx, hcy) {
 }
 
 /* ---- build the SVG from one baked storm payload --------------------------- */
-function buildConeSvg(st, cfg) {
+function buildConeSvg(st, cfg, models) {
   const proj = makeProject(st.bbox);
   const smooth = cfg.smooth !== false;
   const base = [];
@@ -450,6 +462,27 @@ function buildConeSvg(st, cfg) {
   if (st.fcstTrack && st.fcstTrack.length >= 2)
     storm.push(`<polyline class="hu-track-fcst" points="${ptsStr(proj, st.fcstTrack)}"/>`);
 
+  // E4 forecast model tracks (on-demand layer): dashed guidance polylines over
+  // the official track but UNDER the forecast dots (official geometry wins).
+  // Geographic -> they ride hu-pan and pan/zoom with the map. Longitudes are
+  // normalized into the map's 360-degree window (same trick as the home marker)
+  // so an antimeridian-straddling track draws the short way round.
+  const modelRows = [];
+  if (models && models.list && models.list.length) {
+    const cLng = (st.bbox[0] + st.bbox[2]) / 2;
+    for (const m of models.list) {
+      const coords = (m.points || []).map(([lng, lat]) => {
+        let x = lng;
+        while (x - cLng > 180) x -= 360;
+        while (x - cLng < -180) x += 360;
+        return [x, lat];
+      });
+      if (coords.length < 2) continue;
+      storm.push(`<polyline class="hu-model" points="${ptsStr(proj, coords)}" stroke="${modelColor(m.id)}"/>`);
+      modelRows.push([m.label || m.id, modelColor(m.id)]);
+    }
+  }
+
   const keepOut = [];
   const labelJobs = [];
   const projPts = (st.points || []).map((p) => (p.lng == null || p.lat == null) ? null : proj(p.lng, p.lat));
@@ -508,6 +541,28 @@ function buildConeSvg(st, cfg) {
     }
   }
 
+  // E4 model legend: screen-space furniture -> hu-overlays (hides on zoom with
+  // the rest, like region labels). Reserved in keepOut BEFORE region labels and
+  // the scale so they route around it. Loading/failure states are named
+  // honestly -- never a silently missing layer.
+  const mlegend = [];
+  if (models && (modelRows.length || models.loading || models.failed)) {
+    const rows = modelRows.length ? modelRows
+      : [[models.loading ? "Loading model tracks…" : "Model tracks unavailable", null]];
+    const rowH = 16, padX = 8, padY = 6;
+    const maxCh = Math.max(...rows.map((r) => r[0].length));
+    const w = padX + 24 + maxCh * 6.6 + padX;
+    const h = rows.length * rowH + padY * 2;
+    const x0 = 12, y0 = VBH - 12 - h;
+    mlegend.push(`<rect class="hu-mlegend-bg" x="${x0}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
+    rows.forEach(([label, col], i) => {
+      const cy = y0 + padY + i * rowH + rowH / 2;
+      if (col) mlegend.push(`<line class="hu-mlegend-sw" x1="${x0 + padX}" y1="${cy.toFixed(1)}" x2="${x0 + padX + 18}" y2="${cy.toFixed(1)}" stroke="${col}"/>`);
+      mlegend.push(`<text class="hu-mlegend-t" x="${x0 + padX + (col ? 24 : 0)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
+    });
+    keepOut.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+  }
+
   const conePx = (st.cone || []).map((c) => proj(c[0], c[1]));
   const region = cfg.show_labels !== false ? regionLabels(st.labels, proj, st.bbox, keepOut, conePx) : [];
   const scale = (farCase && cfg.show_scale !== false) ? scaleAxes(st.bbox, proj, st.geo, keepOut, conePx, hcx, hcy) : [];
@@ -522,7 +577,7 @@ function buildConeSvg(st, cfg) {
   // simply clipped until a gesture reveals it. viewBox/maxScale ride as data-attrs so
   // the gesture layer can read the pannable extent + zoom ceiling off the DOM.
   const panGroup = [...base, ...windLayer, ...cities, ...storm];
-  const overlayGroup = [...region, ...scale, ...homeParts];
+  const overlayGroup = [...region, ...scale, ...homeParts, ...mlegend];
   const vb = st.viewBox ? st.viewBox.join(" ") : "";
   const ms = st.maxScale != null ? st.maxScale : 1;
   return `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
@@ -672,6 +727,11 @@ const STYLE = `
   .hu-svg.hu-zoomable { cursor: grab; }
   .hu-svg.hu-zoomable.hu-grabbing { cursor: grabbing; }
   .hu-pan { will-change: transform; }
+  .hu-model { fill: none; stroke-width: 1.6; stroke-dasharray: 5 4; opacity: .85;
+              stroke-linejoin: round; stroke-linecap: round; }
+  .hu-mlegend-bg { fill: #14110d; opacity: .55; }
+  .hu-mlegend-sw { stroke-width: 2; stroke-dasharray: 5 4; }
+  .hu-mlegend-t { font: 600 11px/1 sans-serif; fill: #EDE3D2; }
   .hu-overlays.hu-hide { display: none; }
   .hu-tools { position: absolute; top: 10px; right: 10px; z-index: 2; display: flex; gap: 6px; align-items: center; }
   .hu-recenter { display: none; align-items: center; gap: 5px; border: none; cursor: pointer;
@@ -689,6 +749,8 @@ const STYLE = `
               background: var(--card-background-color, var(--primary-background-color)); color: var(--primary-text-color);
               border-radius: 8px; padding: 10px 12px; box-shadow: 0 2px 10px rgba(0,0,0,.35); }
   .hu-panel.hu-open { display: block; }
+  .hu-panel-row.hu-na { opacity: .45; }
+  .hu-panel-note { font: 400 10px/1.2 sans-serif; opacity: .7; margin-left: 4px; }
   .hu-panel-group { font: 700 11px/1 sans-serif; letter-spacing: .06em; text-transform: uppercase;
                     color: var(--secondary-text-color); margin: 6px 0 4px; }
   .hu-panel-group:first-child { margin-top: 0; }
@@ -770,6 +832,7 @@ class HurricaneCard extends HTMLElement {
     // close them under the user), and the per-(storm,advisory) session cache.
     this._layerPrefs = loadLayerPrefs(); this._panelOpen = false;
     this._advOpen = false; this._advTitle = ""; this._advBody = ""; this._layerCache = {};
+    this._layerBusy = {};   // in-flight layer fetches, keyed like _layerCache
   }
 
   setConfig(config) { this._config = config || {}; if (this.shadowRoot) this._render(); }
@@ -859,6 +922,25 @@ class HurricaneCard extends HTMLElement {
     });
   }
 
+  /* Model-tracks layer (E4): fetched over the layer websocket only while the
+   * toggle is on, client-cached per (storm, advisory). Failures are cached
+   * client-side as {failed:true} so a broken deck doesn't refetch every render;
+   * re-toggling the layer clears the failure and retries. */
+  _fetchModels(key, sid) {
+    if (this._layerBusy[key] || !this._hass) return;
+    this._layerBusy[key] = true;
+    this._hass.callWS({ type: WS_LAYER_TYPE, storm_id: sid, layer: "models" }).then((res) => {
+      delete this._layerBusy[key];
+      this._layerCache[key] = (res && res.ok && res.models && res.models.length)
+        ? res : { failed: true };
+      this._render();
+    }).catch(() => {
+      delete this._layerBusy[key];
+      this._layerCache[key] = { failed: true };
+      this._render();
+    });
+  }
+
   _msg(icon, title, sub, spin) {
     return `<div class="hu-msg"><ha-icon class="hu-msg-icon${spin ? " hu-spin" : ""}" icon="${icon}"></ha-icon>
       <div class="hu-msg-title">${esc(title)}</div>${sub ? `<div class="hu-msg-sub">${esc(sub)}</div>` : ""}</div>`;
@@ -899,18 +981,30 @@ class HurricaneCard extends HTMLElement {
           <button data-nav="1" aria-label="Next storm">\u203a</button></div>`;
       }
       const tagName = cfg.title != null ? cfg.title : `Hurricane \u00b7 ${(st.meta && st.meta.basinName) || ""}`;
+      const prefs = this._layerPrefs || {};
+      // E4 model tracks: resolve this storm's layer state for the draw --
+      // cached list, cached failure, or kick an on-demand fetch (loading).
+      // NHC-only; the toggle is disabled for GDACS storms below.
+      let modelState = null;
+      if (prefs.models && isNhcId(st.stormId)) {
+        const mkey = `models|${st.stormId || ""}|${st.advisory || ""}`;
+        const mc = this._layerCache[mkey];
+        if (mc && mc.ok) modelState = { list: mc.models };
+        else if (mc && mc.failed) modelState = { failed: true };
+        else { modelState = { loading: true }; this._fetchModels(mkey, st.stormId || ""); }
+      }
       let svg = "";
-      try { svg = buildConeSvg(st, cfg); }
+      try { svg = buildConeSvg(st, cfg, modelState); }
       catch (e) { svg = this._msg("mdi:map-marker-alert", "Couldn\u2019t draw this storm", "", false); }
       // Map chrome: recenter (zoom), the advisory doc button (only when that
       // layer is on), and the gear that opens the layers panel. The panel lists
       // OPTIONAL_LAYERS grouped by topic; the advisory overlay covers the whole
       // card and survives background re-renders via instance state.
-      const prefs = this._layerPrefs || {};
       let panelRows = "", lastGroup = null;
       for (const l of OPTIONAL_LAYERS) {
         if (l.group !== lastGroup) { panelRows += `<div class="hu-panel-group">${esc(l.group)}</div>`; lastGroup = l.group; }
-        panelRows += `<label class="hu-panel-row"><input type="checkbox" data-layer="${l.id}" ${prefs[l.id] ? "checked" : ""}/> ${esc(l.label)}</label>`;
+        const na = l.nhcOnly && !isNhcId(st.stormId);
+        panelRows += `<label class="hu-panel-row${na ? " hu-na" : ""}"><input type="checkbox" data-layer="${l.id}" ${prefs[l.id] && !na ? "checked" : ""}${na ? " disabled" : ""}/> ${esc(l.label)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}</label>`;
       }
       const tools = `<div class="hu-tools">
           <button class="hu-recenter" aria-label="Recenter map"><ha-icon icon="mdi:image-filter-center-focus"></ha-icon>Recenter</button>
@@ -975,6 +1069,10 @@ class HurricaneCard extends HTMLElement {
         const id = el.getAttribute("data-layer");
         this._layerPrefs = setLayerPref(this._layerPrefs || {}, id, el.checked);
         if (id === "advisory" && !el.checked) this._advOpen = false;
+        // Re-toggling models clears cached failures so the fetch retries fresh.
+        if (id === "models" && el.checked)
+          for (const k of Object.keys(this._layerCache))
+            if (k.startsWith("models|") && this._layerCache[k].failed) delete this._layerCache[k];
         this._render();
       }));
     const doc = this.shadowRoot.querySelector(".hu-doc");
