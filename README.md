@@ -1,5 +1,7 @@
 # Hurricane Tracker for Home Assistant
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=aaronmayeux&repository=ha-hurricane-tracker&category=integration)
+
 Draws a live tropical-cyclone forecast cone on a Lovelace card — the cone of
 uncertainty, past and forecast tracks, Saffir–Simpson forecast points, coastal
 watch/warning segments, region labels, your home location, and a data bar
@@ -43,7 +45,14 @@ you automatically — no manual dashboard resource to add.
 No Python dependencies — the integration parses everything with the standard
 library.
 
-## Installation (HACS — custom repository)
+## Installation (HACS)
+
+**One-click** — click this badge, and it opens your Home Assistant with the
+add-repository screen pre-filled. Confirm it, click **Download**, and restart HA:
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=aaronmayeux&repository=ha-hurricane-tracker&category=integration)
+
+**Or add it manually:**
 
 1. In Home Assistant, open **HACS**.
 2. Click the three-dot menu (top right) → **Custom repositories**.
