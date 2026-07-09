@@ -119,15 +119,27 @@ show_scale: false
 
 ### Map layers (gear menu on the card)
 
-The gear button on the map opens per-viewer layers. These are off by default,
-sticky per browser, and fetch their data **only when switched on** — they never
-add to the integration's background polling, so the baseline card stays cheap
-on low-end hardware.
+The gear button on the map opens per-viewer layer settings. Choices are sticky
+per browser, and on-demand layers fetch their data **only when switched on** —
+they never add to the integration's background polling, so the baseline card
+stays cheap on low-end hardware. Tapping anywhere outside the panel closes it.
+
+**Three-way toggles** — sibling pairs that would fight for the same map space,
+so one draws at a time (left = default, middle = off, right = the alternate):
+
+| Group | Left (default) | Right | Notes |
+|---|---|---|---|
+| Wind field | Current-position 34/50/64 kt field | Full-track wind swath | `show_winds` card config is the master on/off. |
+| Place dots | City dots + names (top places) | Population density — every mapped place, dot size scaled by population, fading with distance from the projected path; adds a "~X people in the cone" line to the data bar (mapped places ≥ 25k only, so it's an undercount) | `show_cities` card config is the master on/off. |
+| Coastal stripe | Watch/warning segments | Peak storm surge inundation bands + "surge at home" (fetched on demand) | Atlantic/East Pacific/Central Pacific storms only. |
+
+**On-demand layers:**
 
 | Layer | What it shows |
 |---|---|
-| Advisory text | The storm's full advisory / alert text in an overlay. |
 | Forecast model tracks | Guidance ("spaghetti") tracks from the NHC forecast models — NHC Official, consensus, GFS, HAFS-A, UKMET. Atlantic/East Pacific/Central Pacific storms only; other basins don't publish per-model tracks. |
+| Wind history trail | The 34 kt wind field as it stood at each past advisory — how the storm's wind field grew. Atlantic/East Pacific/Central Pacific storms only. |
+| Advisory text | The storm's full advisory / alert text in an overlay. |
 
 ### Colors and style (default = follow theme)
 

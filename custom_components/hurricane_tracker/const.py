@@ -148,6 +148,34 @@ MODEL_TRACK_MAX_PTS = 32      # per-model point cap (taus are 6-12 h apart)
 # entirely must not draw a days-old track.
 MODEL_TRACK_STALE_H = 12
 
+# --- E5 on-demand layers: storm surge + wind history (NHC-only) --------------
+# Peak Storm Surge: its OWN MapServer -- NOT per-storm slots. One Points/Lines/
+# Polygons trio serves ALL active storms, and features carry NO stormid field
+# (probed 2026-07-08). Per-storm selection is therefore SPATIAL: query the
+# Polygons layer (2) for features intersecting an envelope around the storm's
+# current position. `name` carries the band label, `symbolid` the NHC color
+# class (blue/yellow/orange/red/purple, rising severity). NOTE: surge
+# watch/warning does NOT exist as a vector product anywhere in the NHC
+# services (layer 9's tcww carries only wind codes HWA/HWR/TWA/TWR;
+# NHC_Breakpoints is static reference points) -- the old "surge W/W stripe"
+# idea is void. Same shipped-unvalidated / soft-fail / validate-on-first-live-
+# storm status as Phases 3/4.
+SURGE_URL = ("https://mapservices.weather.noaa.gov/tropical/rest/services/"
+             "tropical/NHC_PeakStormSurge/MapServer")
+SURGE_POLY_LAYER = 2
+SURGE_ENVELOPE_DEG = 12.0     # +/- degrees around the current position (spatial filter)
+SURGE_OFFSET_DEG = 0.005      # server-side generalization (maxAllowableOffset, degrees)
+SURGE_POINT_BUDGET = 6000     # client-side DP cap across all returned rings
+# Wind history: the per-slot "<slot> Past Wind Radii" layer (AT1 = 14, offset
+# +10 from the slot base -- same deterministic slot-id pattern as Phase 3/4).
+# The 34/50/64 kt field as it was at each PAST advisory; we pull only the
+# 34 kt rings (the growth trail), GEOMETRY included (outSR=4326) -- reading
+# the shipped polygon dodges the where-was-the-center-then problem entirely.
+WIND_HISTORY_OFFSET = 10
+WIND_HISTORY_MAX_ADV = 40     # cap: a long-lived storm carries 40+ advisories
+WIND_HISTORY_OFFSET_DEG = 0.02  # server-side generalization for the rings
+WIND_HISTORY_POINT_BUDGET = 4000  # client-side DP cap across the whole trail
+
 # --- past-track trail -------------------------------------------------------
 # Miles of TRAVEL kept behind the storm, so a fast and a slow storm trail the
 # same physical length on screen (consistent zoom).
@@ -180,7 +208,14 @@ ZOOM_BUFFER_FACTOR = 2.0     # buffered extent = this * the default frame, about
 ZOOM_POINT_BUDGET = 20000    # simplification ceiling for the buffered clip (a cap, not a target)
 ZOOM_PAYLOAD_CAP_BYTES = 400000  # hard cap on the serialized geo; back off tolerance until under
 ZOOM_MAX_SCALE = 3.0         # card zoom-in limit (past this the DP coastline reads chunky)
-CITY_DOT_CAP = 30            # max city dots per payload (top-N by pop_max in the buffered view)
+# Max places per payload (top-N by pop_max in the buffered view). The card
+# slices this: Cities mode draws the top CITY_DOT_DRAW (uniform dots, the
+# pre-E5 look); Population mode draws ALL of them, area-scaled by pop -- the
+# density picture needs the small towns, not just metros (~30 bytes/place,
+# so 120 is ~4 KB against a ~300 KB payload). The 25k pop floor is pack-time
+# (basemap.bin --min-pop); below that simply isn't in the file.
+CITY_DOT_CAP = 120
+CITY_DOT_DRAW = 30           # Cities-mode draw cap (card-side slice)
 
 # --- frontend ---------------------------------------------------------------
 CARD_FILENAME = "hurricane-card.js"

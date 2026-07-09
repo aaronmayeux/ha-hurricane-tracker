@@ -41,9 +41,16 @@ from .const import (
     MODEL_TRACK_STALE_H,
     MODEL_TRACK_TECHS,
     PAST_MILES,
+    SURGE_ENVELOPE_DEG,
+    SURGE_OFFSET_DEG,
+    SURGE_POLY_LAYER,
+    SURGE_URL,
     USER_AGENT,
     WIND_ADVISORY_OFFSET,
     WIND_FORECAST_OFFSET,
+    WIND_HISTORY_MAX_ADV,
+    WIND_HISTORY_OFFSET,
+    WIND_HISTORY_OFFSET_DEG,
     WIND_RADII_URL,
     WIND_SLOT_BLOCK,
     WIND_SLOT_STEP,
@@ -749,6 +756,95 @@ def fetch_model_tracks(storm_id):
         return []
     raw = http_get(ADECK_URL % sid, binary=True)
     return parse_model_tracks(gzip.decompress(raw).decode("utf-8", "replace"))
+
+
+# ---------------------------------------------------------------------------
+# E5 on-demand layers: peak storm surge + per-advisory wind history (NHC-only)
+# ---------------------------------------------------------------------------
+# Both blocking (executor-only), both raise on network failure -- the layer
+# platform (layers.py) catches and soft-fails to an honest "unavailable".
+# Both UNVALIDATED against a live NHC storm (written to the probed schema);
+# on the first-live-storm validation list with Phases 3/4.
+def _esri_rings(feat):
+    """One ArcGIS polygon feature -> list of rings, each [[lng, lat], ...].
+    Assumes outSR=4326 was requested (coords arrive as lon/lat degrees)."""
+    rings = ((feat or {}).get("geometry") or {}).get("rings") or []
+    out = []
+    for r in rings:
+        pts = [[_num(p[0]), _num(p[1])] for p in r
+               if isinstance(p, (list, tuple)) and len(p) >= 2]
+        pts = [p for p in pts if p[0] is not None and p[1] is not None]
+        if len(pts) >= 4:   # esri rings repeat the first point; <4 is degenerate
+            out.append(pts)
+    return out
+
+
+def fetch_peak_surge(lat, lng):
+    """Peak Storm Surge inundation polygons near a storm's current position.
+
+    The PeakStormSurge service is NOT per-storm (no stormid field), so the
+    per-storm filter is spatial: an envelope +/- SURGE_ENVELOPE_DEG around the
+    current center. Returns raw bands [{"name", "sym", "rings"}] in feature
+    order; layers.py simplifies/budgets the rings and runs the at-home test.
+    maxAllowableOffset asks the SERVER to generalize first (these coastal
+    polygons are huge at full resolution)."""
+    if lat is None or lng is None:
+        return []
+    env = "%.4f,%.4f,%.4f,%.4f" % (lng - SURGE_ENVELOPE_DEG, lat - SURGE_ENVELOPE_DEG,
+                                   lng + SURGE_ENVELOPE_DEG, lat + SURGE_ENVELOPE_DEG)
+    params = urllib.parse.urlencode({
+        "geometry": env, "geometryType": "esriGeometryEnvelope",
+        "inSR": 4326, "outSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "name,symbolid", "returnGeometry": "true",
+        "maxAllowableOffset": SURGE_OFFSET_DEG, "where": "1=1", "f": "json",
+    })
+    url = "%s/%d/query?%s" % (SURGE_URL, SURGE_POLY_LAYER, params)
+    data = json.loads(http_get(url))
+    out = []
+    for ft in data.get("features") or []:
+        a = ft.get("attributes") or {}
+        rings = _esri_rings(ft)
+        if not rings:
+            continue
+        name = a.get("name") or a.get("NAME") or ""
+        sym = a.get("symbolid")
+        if sym is None:
+            sym = a.get("SYMBOLID")
+        out.append({"name": str(name).strip(), "sym": sym, "rings": rings})
+    return out
+
+
+def fetch_wind_history(bin_number, storm_id):
+    """Per-advisory 34 kt wind-radii polygons (the growth trail) for one NHC
+    storm, from the per-slot "Past Wind Radii" layer (WIND_HISTORY_OFFSET).
+    Reads the shipped GEOMETRY (outSR=4326) -- no center reconstruction.
+    Returns [{"adv", "t", "rings"}] ascending by synoptic time, capped to the
+    newest WIND_HISTORY_MAX_ADV advisories."""
+    lid = _wind_layer_id({"binNumber": bin_number}, WIND_HISTORY_OFFSET)
+    if lid is None:
+        return []
+    sid = (storm_id or "").upper().strip()
+    where = "stormid='%s' AND radii=34" % sid if sid else "radii=34"
+    params = urllib.parse.urlencode({
+        "where": where, "outFields": "advnum,synoptime,radii",
+        "returnGeometry": "true", "outSR": 4326,
+        "maxAllowableOffset": WIND_HISTORY_OFFSET_DEG, "f": "json",
+    })
+    url = "%s/%d/query?%s" % (WIND_RADII_URL, lid, params)
+    data = json.loads(http_get(url))
+    out = []
+    for ft in data.get("features") or []:
+        a = ft.get("attributes") or {}
+        rings = _esri_rings(ft)
+        if not rings:
+            continue
+        t = _num(a.get("synoptime"))
+        adv = a.get("advnum")
+        out.append({"adv": str(adv).strip() if adv is not None else "",
+                    "t": t, "rings": rings})
+    out.sort(key=lambda d: (d["t"] is None, d["t"]))
+    return out[-WIND_HISTORY_MAX_ADV:]
 
 
 # ---------------------------------------------------------------------------

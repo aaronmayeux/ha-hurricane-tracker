@@ -21,13 +21,34 @@ import html as _html
 import logging
 import re
 
-from . import nhc
+from . import geometry, nhc
+from .const import (
+    SURGE_OFFSET_DEG,
+    SURGE_POINT_BUDGET,
+    WIND_HISTORY_OFFSET_DEG,
+    WIND_HISTORY_POINT_BUDGET,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LAYER_ADVISORY = "advisory"
 LAYER_MODELS = "models"
-LAYERS = {LAYER_ADVISORY, LAYER_MODELS}
+LAYER_SURGE = "surge"
+LAYER_WIND_HISTORY = "wind_history"
+LAYERS = {LAYER_ADVISORY, LAYER_MODELS, LAYER_SURGE, LAYER_WIND_HISTORY}
+
+# Rising-severity order of the PeakStormSurge symbolid color classes -- used to
+# pick the WORST band containing home when bands overlap. Unknown symbols rank
+# lowest (still reported, just conservatively ordered).
+_SURGE_SEVERITY = ("blue", "yellow", "orange", "red", "purple")
+
+
+def _surge_rank(sym):
+    s = str(sym or "").lower()
+    for i, c in enumerate(_SURGE_SEVERITY):
+        if c in s:
+            return i
+    return -1
 
 # Cache cap. Keys are (storm_id, layer, advisory); texts are small, but don't
 # let a long multi-storm season accumulate stale advisories.
@@ -81,10 +102,81 @@ def _models_result(storm_id, meta):
             "models": models}
 
 
+def _surge_result(meta):
+    """Peak storm surge (E5) for one NHC storm: inundation bands + the at-home
+    test. NHC-only (GDACS has no surge product) -> None for GDACS. Blocking
+    (HTTP) -> executor-only. None = nothing usable (honest 'unavailable')."""
+    if meta.get("source") == "gdacs":
+        return None
+    feats = nhc.fetch_peak_surge(meta.get("lat"), meta.get("lng"))
+    if not feats:
+        return None
+    # Budget is shared across the whole layer: simplify per band against the
+    # remaining allowance so one sprawling band can't starve the rest entirely.
+    bands = []
+    remaining = SURGE_POINT_BUDGET
+    for ft in feats:
+        if remaining <= 0:
+            break
+        rings = geometry.simplify_rings(ft["rings"], SURGE_OFFSET_DEG,
+                                        budget=remaining)
+        if not rings:
+            continue
+        remaining -= sum(len(r) for r in rings)
+        bands.append({"label": ft["name"], "sym": ft["sym"], "rings": rings})
+    if not bands:
+        return None
+    # At-home test on the RAW (pre-simplify) rings -- worst band containing
+    # home wins. Uses the same ray-cast as the Phase 3 wind report.
+    at_home, at_rank = None, -2
+    home = meta.get("home") or [None, None]
+    hlat, hlng = home[0], home[1]
+    if hlat is not None and hlng is not None:
+        for ft in feats:
+            if any(geometry._pt_in_ring(hlng, hlat, r) for r in ft["rings"]):
+                rank = _surge_rank(ft["sym"])
+                if rank > at_rank:
+                    at_home, at_rank = ft["name"], rank
+    return {"ok": True, "layer": LAYER_SURGE,
+            "advisory": str(meta.get("advisory") or ""),
+            "bands": bands, "atHome": at_home}
+
+
+def _wind_history_result(storm_id, meta):
+    """Per-advisory 34 kt growth trail (E5) for one NHC storm. NHC-only (GDACS's
+    whole-track swath already carries its wind history) -> None for GDACS.
+    Blocking (HTTP) -> executor-only. None = nothing usable."""
+    if meta.get("source") == "gdacs":
+        return None
+    hist = nhc.fetch_wind_history(meta.get("binNumber"), storm_id)
+    if not hist:
+        return None
+    remaining = WIND_HISTORY_POINT_BUDGET
+    advisories = []
+    for h in hist:
+        if remaining <= 0:
+            break
+        rings = geometry.simplify_rings(h["rings"], WIND_HISTORY_OFFSET_DEG,
+                                        budget=remaining)
+        if not rings:
+            continue
+        remaining -= sum(len(r) for r in rings)
+        advisories.append({"adv": h["adv"], "rings": rings})
+    if not advisories:
+        return None
+    return {"ok": True, "layer": LAYER_WIND_HISTORY,
+            "advisory": str(meta.get("advisory") or ""),
+            "advisories": advisories}
+
+
 def _build_result(layer, storm_id, meta):
     """Dispatch: build one layer's result. Blocking; executor-only."""
     if layer == LAYER_MODELS:
         return _models_result(storm_id, meta)
+    if layer == LAYER_SURGE:
+        return _surge_result(meta)
+    if layer == LAYER_WIND_HISTORY:
+        return _wind_history_result(storm_id, meta)
     return _advisory_result(meta)
 
 

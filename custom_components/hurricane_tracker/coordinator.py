@@ -197,10 +197,10 @@ def _build(home_lat, home_lon, basin, units, storm_filter, range_mi=None,
     return {"ok": True, "storms": payloads, "count": len(payloads),
             "anyStale": any(p.get("stale") for p in payloads),
             "anyFresh": baked_ok, "ts": now_ms,
-            "layerMeta": _layer_meta(selected[:MAX_STORMS])}
+            "layerMeta": _layer_meta(selected[:MAX_STORMS], home_lat, home_lon)}
 
 
-def _layer_meta(storms):
+def _layer_meta(storms, home_lat=None, home_lon=None):
     """Per-storm inputs for the on-demand layer platform (layers.py), built
     from the storm lists this poll already fetched -- no extra HTTP. GDACS
     carries its advisory text inline (it rides the event feed); NHC carries
@@ -239,6 +239,13 @@ def _layer_meta(storms):
                 "source": "nhc", "name": storm.get("name") or "",
                 "advisory": str(pub.get("advNum") or ""),
                 "products": products,
+                # E5 (surge + wind history): the slot bin drives the per-slot
+                # layer id; lat/lng anchors the surge spatial envelope; home
+                # feeds the surge at-home test. All already in hand this poll.
+                "binNumber": storm.get("binNumber"),
+                "lat": storm.get("latitudeNumeric"),
+                "lng": storm.get("longitudeNumeric"),
+                "home": [home_lat, home_lon],
             }
     return out
 

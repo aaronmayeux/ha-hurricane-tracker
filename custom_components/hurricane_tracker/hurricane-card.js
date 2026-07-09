@@ -27,13 +27,97 @@ const VBW = 800, VBH = 600;
  * not dashboard config, and stickiness is what makes the lazy fetch cost okay
  * (paid once per advisory, not per glance). */
 const OPTIONAL_LAYERS = [
-  { id: "advisory", label: "Advisory text", group: "Storm info", radio: null },
   { id: "models", label: "Forecast model tracks", group: "Storm info", radio: null, nhcOnly: true },
-  // Client-only render toggle (no fetch): wind data is already in the bake. OFF
-  // (default) = the singular current-position 34/50/64 field; ON = the full-track
-  // swath (GDACS's whole-track envelope / NHC's forecast corridor).
-  { id: "wind_swath", label: "Full-track wind swath", group: "Wind field", radio: null },
+  { id: "wind_history", label: "Wind history trail", group: "Storm info", radio: null, nhcOnly: true },
+  // Advisory text sits LAST in the panel and is off by default (Aaron's call).
+  { id: "advisory", label: "Advisory text", group: "Storm info", radio: null },
 ];
+/* Three-way sibling toggles (E5). Each group is ONE slider: LEFT = the default
+ * sibling (matches pre-E5 always-on behavior, so left is the out-of-box state),
+ * CENTER = both off, RIGHT = the alternate sibling. States are the strings
+ * "left" | "off" | "right" in prefs.tri[key] (sticky per browser, like the
+ * layer toggles). Wind + dots are client-only re-renders (data already baked);
+ * stripe-right (storm surge) is an on-demand fetch over the layer websocket.
+ * `master` names a card-config toggle that gates the whole group (dashboard
+ * admin wins over viewer prefs); `nhcOnly` groups render disabled on GDACS
+ * storms and fall back to their left/default state. */
+const TRI_GROUPS = [
+  { key: "wind",   title: "Wind field",     lLabel: "Current",    rLabel: "Swath",      def: "left", master: "show_winds" },
+  { key: "dots",   title: "Place dots",     lLabel: "Cities",     rLabel: "Population", def: "left", master: "show_cities" },
+  { key: "stripe", title: "Coastal stripe", lLabel: "Watch/warn", rLabel: "Surge",      def: "left", nhcOnly: true },
+];
+function triState(prefs, key) {
+  const g = TRI_GROUPS.find((t) => t.key === key);
+  const v = prefs && prefs.tri ? prefs.tri[key] : null;
+  return (v === "left" || v === "off" || v === "right") ? v : (g ? g.def : "off");
+}
+function setTriPref(prefs, key, v) {
+  prefs.tri = prefs.tri || {};
+  prefs.tri[key] = v;
+  saveLayerPrefs(prefs);
+  return prefs;
+}
+/* Population-scaled dot radius (E5 pop-density rendering): RELATIVE to the
+ * places in the current frame -- biggest drawn city = 9px, smallest = 2.2px,
+ * sqrt-interpolated (area-proportional between the frame's extremes). Two
+ * absolute ramps were tried and BOTH flattened out (log compressed everything
+ * to a 1-2px spread; absolute-sqrt capped every 1.5M+ metro at 9px, and in a
+ * metro-dense frame like East Asia the top-N selection is ALL 1.5M+ metros).
+ * Per-frame normalization is standard graduated-symbol practice and shows the
+ * full size range in every region; don't go back to an absolute ramp. */
+function popScaler(pops) {
+  let lo = Infinity, hi = 0;
+  for (const n of pops) {
+    const v = Math.sqrt(Math.max(Number(n) || 0, 1));
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  const span = hi - lo;
+  return (pop) => {
+    if (span <= 0) return 4.5;   // degenerate frame (all same pop) -> midsize
+    const v = Math.sqrt(Math.max(Number(pop) || 0, 1));
+    return 1.6 + 7.4 * ((v - lo) / span);
+  };
+}
+/* Min px distance from a point to a polygon/polyline (0 when inside a
+ * closed poly). Used for the population-dot fade along the projected path. */
+function distToPoly(x, y, poly) {
+  if (poly.length >= 3 && pointInPoly(x, y, poly)) return 0;
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const ax = poly[j][0], ay = poly[j][1];
+    const dx = poly[i][0] - ax, dy = poly[i][1] - ay;
+    const dd = dx * dx + dy * dy;
+    let t = dd ? ((x - ax) * dx + (y - ay) * dy) / dd : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const d = Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+    if (d < best) best = d;
+  }
+  return best;
+}
+/* Population-dot fade: gaussian falloff of dot opacity with px distance from
+ * the cone (sigma below); full strength inside/at the cone, gone ~2.5 sigma
+ * out. Per-dot opacity is the cheap equivalent of a blur-out -- an actual SVG
+ * gaussian filter over hundreds of circles would wreck phone GPUs. Dots that
+ * fade below POP_ALPHA_MIN are skipped entirely (fewer DOM nodes). */
+const POP_FADE_SIGMA = 112;   // was 90; +25% visible radius (Aaron, 2026-07-08)
+const POP_BASE_ALPHA = 0.64;   // ~20% more transparent than the first cut (.8)
+const POP_ALPHA_MIN = 0.04;
+/* Compact population figure for the data bar: 34M / 3.4M / 820k. */
+const fmtPop = (n) => n >= 1e6 ? ((n / 1e6 >= 10 ? Math.round(n / 1e6) : (n / 1e6).toFixed(1)) + "M")
+  : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(n);
+/* Cities-mode draw cap: the payload carries ~120 places for the density view;
+ * uniform city dots keep the old top-30 look (payload arrives pop-sorted). */
+const CITY_DOT_DRAW = 30;
+/* Peak-surge band identity colors (NHC's blue->purple severity ramp, fixed
+ * hexes). symbolid is matched by color word; unknown falls back by index. */
+const SURGE_COLOR = { blue: "#64B5F6", yellow: "#FFE14D", orange: "#FB8C00", red: "#E53935", purple: "#AB47BC" };
+const SURGE_ORDER = ["blue", "yellow", "orange", "red", "purple"];
+function surgeColor(band, i) {
+  const s = String((band && band.sym) || "").toLowerCase();
+  for (const k of SURGE_ORDER) if (s.includes(k)) return SURGE_COLOR[k];
+  return SURGE_COLOR[SURGE_ORDER[Math.min(Math.max(i, 0), 4)]];
+}
 /* NHC storm ids are basin-prefixed (al/ep/cp + number + year); GDACS ids are
  * bare event numbers. Gates the NHC-only layers (model tracks). */
 const isNhcId = (sid) => /^(al|ep|cp)\d/i.test(sid || "");
@@ -47,8 +131,13 @@ const MODEL_COLOR = {
 const modelColor = (id) => MODEL_COLOR[id] || "#9E9E9E";
 const LAYER_STORE_KEY = "hurricane-card:layers";
 function loadLayerPrefs() {
-  try { return JSON.parse(localStorage.getItem(LAYER_STORE_KEY)) || {}; }
-  catch (_) { return {}; }   // storage blocked (some webviews) -> session-only
+  let p;
+  try { p = JSON.parse(localStorage.getItem(LAYER_STORE_KEY)) || {}; }
+  catch (_) { p = {}; }   // storage blocked (some webviews) -> session-only
+  // Migrate the pre-E5 wind_swath boolean into the wind tri-state.
+  if (!p.tri) { p.tri = {}; if (p.wind_swath) p.tri.wind = "right"; }
+  delete p.wind_swath;
+  return p;
 }
 function saveLayerPrefs(p) {
   try { localStorage.setItem(LAYER_STORE_KEY, JSON.stringify(p)); } catch (_) {}
@@ -377,7 +466,7 @@ function layoutZoomLabels(ctx, view) {
       taken.push([sx, sy]);
       txt = `<text class="hu-city-label" x="6" y="3.5">${esc(p.name)}</text>`;
     }
-    cities.push(zl(p.x, p.y, `<circle class="hu-city" r="2.6"/>` + txt));
+    cities.push(zl(p.x, p.y, `<circle class="${p.cls || "hu-city"}" r="${(p.r || 2.6).toFixed(1)}"/>` + txt));
   }
   return { regions: regions.join(""), cities: cities.join("") };
 }
@@ -435,9 +524,19 @@ function scaleAxes(bbox, proj, geo, keepOut, conePx, hcx, hcy) {
 }
 
 /* ---- build the SVG from one baked storm payload --------------------------- */
-function buildConeSvg(st, cfg, models, prefs) {
+function buildConeSvg(st, cfg, models, prefs, lay) {
   prefs = prefs || {};
+  lay = lay || {};
+  // E5 three-way sibling groups, resolved once per build. Card-config masters
+  // gate whole groups (dashboard admin wins); the stripe group is NHC-only and
+  // falls back to its left/default (watch/warning) on GDACS storms -- GDACS
+  // carries no ww segments, so that draws nothing there anyway.
+  const nhcStorm = isNhcId(st.stormId);
+  const triWind = cfg.show_winds === false ? "off" : triState(prefs, "wind");
+  const triDots = cfg.show_cities === false ? "off" : triState(prefs, "dots");
+  const triStripe = nhcStorm ? triState(prefs, "stripe") : "left";
   const proj = makeProject(st.bbox);
+  const conePx = (st.cone || []).map((c) => proj(c[0], c[1]));
   const smooth = cfg.smooth !== false;
   const base = [];
   if (cfg.show_land !== false)
@@ -458,15 +557,16 @@ function buildConeSvg(st, cfg, models, prefs) {
   // round those into organic curves. This keeps the lopsided extents intact --
   // smoothing, not circularizing.
   const windLayer = [];
-  // Wind source: the singular current-position 34/50/64 field by default; the
-  // full-track swath when `wind_swath` is on. GDACS's swath spans the whole track
-  // (past + forecast), so it doubles as the wind-history footprint; the current
-  // field is just the present center. Fall back to whichever exists so a storm
-  // that only has one of the two still draws.
-  let windSrc = st.windField;
-  if (prefs.wind_swath && st.windSwath && st.windSwath.length) windSrc = st.windSwath;
-  else if ((!windSrc || !windSrc.length) && st.windSwath && st.windSwath.length) windSrc = st.windSwath;
-  if (cfg.show_winds !== false && windSrc && windSrc.length)
+  // Wind source follows the wind tri-state: LEFT (default) = the singular
+  // current-position 34/50/64 field, RIGHT = the full-track swath (GDACS's
+  // whole-track envelope / NHC's forecast corridor), CENTER = off. Each side
+  // falls back to whichever exists so a storm with only one still draws.
+  let windSrc = null;
+  if (triWind === "left")
+    windSrc = (st.windField && st.windField.length) ? st.windField : st.windSwath;
+  else if (triWind === "right")
+    windSrc = (st.windSwath && st.windSwath.length) ? st.windSwath : st.windField;
+  if (windSrc && windSrc.length)
     for (const w of windSrc) {
       // Union the tier's rings into ONE path so the blobs along the track merge into
       // a single uniform fill (nonzero winding) -- no darker seams where they overlap.
@@ -490,19 +590,79 @@ function buildConeSvg(st, cfg, models, prefs) {
     while (x - cLng0 < -180) x += 360;
     return x;
   };
+  // Place dots, two very different modes:
+  // - Cities (left): top CITY_DOT_DRAW places as uniform labeled dots via the
+  //   zoom-label engine -- the classic navigational look.
+  // - Population (right): the DENSITY picture. Every mapped place in the
+  //   buffered view (popGrid, typically hundreds), dot AREA scaled relative to
+  //   the frame's extremes, freely overlapping. Drawn as plain circles in
+  //   hu-pan so they zoom with the coastline (a density surface, not
+  //   furniture) -- this also keeps the gesture loop free of hundreds of
+  //   counter-scaled label groups. No names: names live in Cities mode.
+  //   Falls back to the top-N places when an old payload has no popGrid.
   const ctxCities = [];
-  if (cfg.show_cities !== false && st.places && st.places.length)
-    for (const p of st.places) {
+  const gridDots = [];
+  let gridPts = null;   // [x, y, pop] px points for the in-cone impact sum
+  if (triDots === "left" && st.places && st.places.length) {
+    for (const p of st.places.slice(0, CITY_DOT_DRAW)) {
       const [x, y] = proj(normLng(p.lng), p.lat);
-      ctxCities.push({ name: p.name, x, y });
+      ctxCities.push({ name: p.name, x, y, r: 2.6, cls: "hu-city" });
     }
+  } else if (triDots === "right") {
+    const grid = (st.popGrid && st.popGrid.length)
+      ? st.popGrid : (st.places || []).map((p) => [p.lng, p.lat, p.pop]);
+    if (grid.length) {
+      const rOf = popScaler(grid.map((g) => g[2]));
+      // Fade reference: the cone polygon (projected path incl. uncertainty);
+      // no cone -> the forecast track line; neither -> no fade (all dots).
+      let fadePoly = conePx.length >= 3 ? conePx
+        : (st.fcstTrack && st.fcstTrack.length >= 2)
+          ? st.fcstTrack.map((c) => proj(c[0], c[1])) : null;
+      const s2 = 2 * POP_FADE_SIGMA * POP_FADE_SIGMA;
+      gridPts = [];
+      for (const [lng, lat, pop] of grid) {
+        const [x, y] = proj(normLng(lng), lat);
+        gridPts.push([x, y, pop]);
+        let a = POP_BASE_ALPHA;
+        if (fadePoly) {
+          const d = distToPoly(x, y, fadePoly);
+          a = POP_BASE_ALPHA * Math.exp(-(d * d) / s2);
+          if (a < POP_ALPHA_MIN) continue;   // invisible -> skip the node
+        }
+        gridDots.push(`<circle class="hu-popdot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${rOf(pop).toFixed(1)}" opacity="${a.toFixed(2)}"/>`);
+      }
+    }
+  }
+
+  // E5 storm surge (stripe-right, on-demand): inundation bands drawn as filled
+  // coastal polygons UNDER the storm data, NHC's blue->purple severity ramp.
+  // Geometry arrives pre-simplified from the layer websocket; no smoothing
+  // (these are detailed coastal fills -- curves would misplace water lines).
+  const surgeLayer = [];
+  if (triStripe === "right" && lay.surge && lay.surge.bands)
+    lay.surge.bands.forEach((b, i) => {
+      let d = "";
+      for (const ring of b.rings || [])
+        if (ring.length >= 3) d += basePath(proj, ring.map(([lng, lat]) => [normLng(lng), lat]), true, false);
+      if (d) surgeLayer.push(`<path class="hu-surge" style="fill:${surgeColor(b, i)}" d="${d}"/>`);
+    });
+
+  // E5 wind-history trail (independent on-demand layer): each past advisory's
+  // 34 kt field as a faint dashed outline -- the growth trail along the track.
+  const whistLayer = [];
+  if (lay.whist && lay.whist.advisories)
+    for (const advE of lay.whist.advisories)
+      for (const ring of advE.rings || [])
+        if (ring.length >= 3)
+          whistLayer.push(`<polygon class="hu-whist" points="${ptsStr(proj, ring.map(([lng, lat]) => [normLng(lng), lat]))}"/>`);
 
   const storm = [];
-  for (const seg of st.ww || []) {
-    const col = wwColor(seg.type);
-    if (col && seg.coords && seg.coords.length >= 2)
-      storm.push(`<polyline class="hu-ww" points="${ptsStr(proj, seg.coords)}" stroke="${col}"/>`);
-  }
+  if (triStripe === "left")
+    for (const seg of st.ww || []) {
+      const col = wwColor(seg.type);
+      if (col && seg.coords && seg.coords.length >= 2)
+        storm.push(`<polyline class="hu-ww" points="${ptsStr(proj, seg.coords)}" stroke="${col}"/>`);
+    }
   if (st.cone && st.cone.length >= 3)
     storm.push(`<polygon class="hu-cone-poly" points="${ptsStr(proj, st.cone)}"/>`);
   if (st.pastTrack && st.pastTrack.length >= 2)
@@ -595,9 +755,13 @@ function buildConeSvg(st, cfg, models, prefs) {
   // the scale so they route around it. Loading/failure states are named
   // honestly -- never a silently missing layer.
   const mlegend = [];
-  if (models && (modelRows.length || models.loading || models.failed)) {
-    const rows = modelRows.length ? modelRows
-      : [[models.loading ? "Loading model tracks…" : "Model tracks unavailable", null]];
+  const whistPending = lay.whist && (lay.whist.loading || lay.whist.failed);
+  if ((models && (modelRows.length || models.loading || models.failed)) || whistPending) {
+    const rows = modelRows.length ? modelRows.slice() : [];
+    if (models && !modelRows.length && (models.loading || models.failed))
+      rows.push([models.loading ? "Loading model tracks…" : "Model tracks unavailable", null]);
+    if (whistPending)
+      rows.push([lay.whist.loading ? "Loading wind history…" : "Wind history unavailable", null]);
     const rowH = 16, padX = 8, padY = 6;
     const maxCh = Math.max(...rows.map((r) => r[0].length));
     const w = padX + 24 + maxCh * 6.6 + padX;
@@ -612,7 +776,45 @@ function buildConeSvg(st, cfg, models, prefs) {
     keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
   }
 
-  const conePx = (st.cone || []).map((c) => proj(c[0], c[1]));
+  // E5 surge legend: bottom-right screen-space furniture (hu-overlays; hides on
+  // zoom like the model legend). Band labels with their fill swatches; loading/
+  // failure states named honestly -- never a silently missing layer.
+  const slegend = [];
+  if (triStripe === "right" && lay.surge
+      && (lay.surge.loading || lay.surge.failed || (lay.surge.bands && lay.surge.bands.length))) {
+    const seen = new Set(), rows = [];
+    if (lay.surge.bands)
+      lay.surge.bands.forEach((b, i) => {
+        const lbl = b.label || "Surge area";
+        if (seen.has(lbl) || rows.length >= 5) return;
+        seen.add(lbl);
+        rows.push([lbl, surgeColor(b, i)]);
+      });
+    if (!rows.length)
+      rows.push([lay.surge.loading ? "Loading storm surge…" : "Storm surge unavailable", null]);
+    const rowH = 16, padX = 8, padY = 6;
+    const maxCh = Math.max(...rows.map((r) => r[0].length));
+    const w = padX + 18 + maxCh * 6.6 + padX;
+    const h = rows.length * rowH + padY * 2;
+    const x0 = VBW - 12 - w, y0 = VBH - 12 - h;
+    slegend.push(`<rect class="hu-mlegend-bg" x="${x0.toFixed(0)}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
+    rows.forEach(([label, col], i) => {
+      const cy = y0 + padY + i * rowH + rowH / 2;
+      if (col) slegend.push(`<rect class="hu-slegend-sw" x="${(x0 + padX).toFixed(1)}" y="${(cy - 5).toFixed(1)}" width="10" height="10" rx="2" fill="${col}"/>`);
+      slegend.push(`<text class="hu-mlegend-t" x="${(x0 + padX + (col ? 16 : 0)).toFixed(1)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
+    });
+    keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+  }
+
+  // E5 population impact: sum the mapped-city population inside the forecast
+  // cone (Population mode only). An undercount by construction -- the basemap
+  // only carries places >= 25k -- so the data bar labels it "mapped cities".
+  let popImpact = null;
+  if (gridPts && conePx.length >= 3) {
+    popImpact = 0;
+    for (const [gx, gy, gp] of gridPts)
+      if (pointInPoly(gx, gy, conePx)) popImpact += gp || 0;
+  }
   const scale = (farCase && cfg.show_scale !== false)
     ? scaleAxes(st.bbox, proj, st.geo, keepOut.concat(keepScreen), conePx, hcx, hcy) : [];
 
@@ -647,10 +849,10 @@ function buildConeSvg(st, cfg, models, prefs) {
   // maxScale ride as data-attrs so the gesture layer can read the pannable extent
   // + zoom ceiling off the DOM. Returns {svg, ctx}: the card stashes ctx for the
   // engine's re-runs.
-  const panGroup = [...base, ...windLayer,
+  const panGroup = [...base, ...windLayer, ...surgeLayer, ...whistLayer, ...gridDots,
     `<g class="hu-zl-cities">${zl0.cities}</g>`, ...storm,
     `<g class="hu-zl-regions">${zl0.regions}</g>`];
-  const overlayGroup = [...scale, ...homeParts, ...mlegend];
+  const overlayGroup = [...scale, ...homeParts, ...mlegend, ...slegend];
   const vb = st.viewBox ? st.viewBox.join(" ") : "";
   const ms = st.maxScale != null ? st.maxScale : 1;
   const svg = `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
@@ -658,10 +860,10 @@ function buildConeSvg(st, cfg, models, prefs) {
     + `<g class="hu-pan">${panGroup.join("")}</g>`
     + `<g class="hu-overlays">${overlayGroup.join("")}</g>`
     + `</svg>`;
-  return { svg, ctx };
+  return { svg, ctx, popImpact };
 }
 
-function dataBar(st) {
+function dataBar(st, lay, popImpact) {
   const m = st.meta || {};
   let name = (m.name || "Storm").replace(/\s*\([^)]*\)\s*$/, "").trim();
   const tag = catLabel(m.cat);
@@ -699,6 +901,14 @@ function dataBar(st) {
       bits.push("moving away");                  // closest point is now/behind -- receding
     }
   }
+  // E5 surge at-home line: present only while the surge layer is selected AND
+  // home sits inside a returned band. The label is NHC's own band text.
+  if (lay && lay.surge && lay.surge.ok && lay.surge.atHome)
+    bits.push(`surge at home: ${lay.surge.atHome}`);
+  // E5 population impact (Population dot mode): honest about the undercount --
+  // only mapped places (>= 25k) are summed.
+  if (popImpact != null && popImpact > 0)
+    bits.push(`~${fmtPop(popImpact)} people in the cone (mapped cities)`);
   let peak = "";
   if (m.peak && m.peak.word) peak = `<div class="hu-bar-peak">Peak ${esc(m.peak.word)}${m.peak.label ? " by " + esc(m.peak.label) : ""}</div>`;
   return `<div class="hu-bar-name">${esc(name)}</div><div class="hu-bar-data">${esc(bits.join(" \u00b7 "))}</div>${peak}`;
@@ -819,17 +1029,48 @@ const STYLE = `
                 border-radius: 16px; width: 32px; height: 26px;
                 box-shadow: 0 1px 4px rgba(0,0,0,.3); opacity: .94; }
   .hu-toolbtn ha-icon { --mdc-icon-size: 16px; }
-  .hu-panel { position: absolute; top: 44px; right: 10px; z-index: 3; display: none; min-width: 170px;
+  .hu-panel { position: absolute; top: 44px; right: 10px; z-index: 3; display: none; width: 232px;
+              max-width: calc(100% - 20px); box-sizing: border-box;
               background: var(--card-background-color, var(--primary-background-color)); color: var(--primary-text-color);
-              border-radius: 8px; padding: 10px 12px; box-shadow: 0 2px 10px rgba(0,0,0,.35); }
+              border-radius: 16px; padding: 12px 14px 10px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
   .hu-panel.hu-open { display: block; }
   .hu-panel-row.hu-na { opacity: .45; }
   .hu-panel-note { font: 400 10px/1.2 sans-serif; opacity: .7; margin-left: 4px; }
-  .hu-panel-group { font: 700 11px/1 sans-serif; letter-spacing: .06em; text-transform: uppercase;
-                    color: var(--secondary-text-color); margin: 6px 0 4px; }
+  .hu-panel-group { font: 700 10.5px/1 sans-serif; letter-spacing: .08em; text-transform: uppercase;
+                    color: var(--secondary-text-color); margin: 12px 0 6px; display: flex;
+                    align-items: baseline; gap: 6px; }
   .hu-panel-group:first-child { margin-top: 0; }
-  .hu-panel-row { display: flex; align-items: center; gap: 8px; font: 400 13px/1.2 sans-serif;
-                  padding: 4px 0; cursor: pointer; }
+  /* M3 segmented button: full-width pill, hairline outline, equal segments,
+   * selected segment tinted with the theme primary. Disabled group = 38%. */
+  .hu-seg { display: flex; width: 100%; height: 32px; box-sizing: border-box;
+            border: 1px solid var(--divider-color, rgba(127,127,127,.45)); border-radius: 16px; overflow: hidden; }
+  .hu-seg-btn { flex: 1 1 0; min-width: 0; border: none; background: transparent; cursor: pointer;
+                color: var(--primary-text-color); font: 500 12px/1 sans-serif; padding: 0 2px;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                border-left: 1px solid var(--divider-color, rgba(127,127,127,.45)); }
+  .hu-seg-btn:first-child { border-left: none; }
+  .hu-seg-btn.hu-sel { background: rgba(3,169,244,.24);
+                       background: color-mix(in srgb, var(--primary-color, #03a9f4) 26%, transparent);
+                       font-weight: 700; }
+  .hu-seg.hu-na { opacity: .38; pointer-events: none; }
+  /* M3 list row + switch: label left, switch right, one vertical grid. */
+  .hu-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+                  font: 400 13px/1.25 sans-serif; padding: 5px 0; cursor: pointer; }
+  .hu-row-lbl { display: flex; flex-direction: column; min-width: 0; }
+  .hu-row-lbl .hu-panel-note { margin-left: 0; }
+  input.hu-sw { appearance: none; -webkit-appearance: none; width: 44px; height: 26px; border-radius: 13px;
+                margin: 0; flex: none; position: relative; cursor: pointer;
+                background: var(--secondary-background-color); box-sizing: border-box;
+                border: 1.5px solid var(--divider-color, rgba(127,127,127,.55));
+                transition: background .15s, border-color .15s; }
+  input.hu-sw::after { content: ""; position: absolute; top: 50%; left: 3px; transform: translateY(-50%);
+                       width: 16px; height: 16px; border-radius: 50%;
+                       background: var(--secondary-text-color); transition: left .15s, width .15s, height .15s, background .15s; }
+  input.hu-sw:checked { background: var(--primary-color, #03a9f4); border-color: var(--primary-color, #03a9f4); }
+  input.hu-sw:checked::after { left: 21px; width: 20px; height: 20px; background: #fff; }
+  .hu-panel-perf { font: 400 10.5px/1.4 sans-serif; color: var(--secondary-text-color); opacity: .8;
+                   margin-top: 10px; padding-top: 8px;
+                   border-top: 1px solid var(--divider-color, rgba(127,127,127,.3)); }
   .hu-adv { position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column;
             background: var(--card-background-color, var(--primary-background-color)); }
   .hu-adv-head { display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -855,6 +1096,10 @@ const STYLE = `
                     paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
   .hu-wind { fill-opacity: .42; stroke: none; }
   .hu-ww { fill: none; stroke-width: 4; stroke-linecap: round; }
+  .hu-surge { fill-opacity: .5; stroke: none; }
+  .hu-whist { fill: none; stroke: var(--primary-text-color); stroke-opacity: .3; stroke-width: 1.2; stroke-dasharray: 3 3; }
+  .hu-popdot { fill: #4FC3F7; stroke: rgba(0,0,0,.35); stroke-width: .5; }
+  .hu-slegend-sw { stroke: rgba(0,0,0,.3); stroke-width: .5; }
   .hu-cone-poly { fill: var(--hu-cone-color, var(--primary-text-color)); fill-opacity: .08; stroke: var(--hu-cone-color, var(--primary-text-color)); stroke-opacity: .3; stroke-width: 1; }
   .hu-track-past { fill: none; stroke: var(--hu-track-past-color, var(--secondary-text-color)); stroke-width: 2; stroke-dasharray: 4 5; opacity: .6; }
   .hu-track-fcst { fill: none; stroke: var(--hu-track-color, var(--primary-text-color)); stroke-width: 2.5; opacity: .85; }
@@ -923,8 +1168,25 @@ class HurricaneCard extends HTMLElement {
   connectedCallback() {
     if (this._hass && !this._data) { this._render(); this._fetch(); }
     if (!this._timer) this._timer = setInterval(() => this._fetch(), REFRESH_MS);
+    // A tap/click anywhere OUTSIDE the open layers panel closes it. Capture
+    // phase + composedPath so taps on other cards or dashboard chrome count;
+    // taps on the panel itself or the gear button pass through untouched.
+    if (!this._docClose) {
+      this._docClose = (e) => {
+        if (!this._panelOpen) return;
+        const path = e.composedPath ? e.composedPath() : [];
+        if (path.some((n) => n && n.classList
+            && (n.classList.contains("hu-panel") || n.classList.contains("hu-gear")))) return;
+        this._panelOpen = false;
+        this._render();
+      };
+      document.addEventListener("click", this._docClose, true);
+    }
   }
-  disconnectedCallback() { if (this._timer) { clearInterval(this._timer); this._timer = null; } }
+  disconnectedCallback() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._docClose) { document.removeEventListener("click", this._docClose, true); this._docClose = null; }
+  }
 
   _fetch() {
     if (!this._hass) return;
@@ -996,23 +1258,45 @@ class HurricaneCard extends HTMLElement {
     });
   }
 
-  /* Model-tracks layer (E4): fetched over the layer websocket only while the
-   * toggle is on, client-cached per (storm, advisory). Failures are cached
-   * client-side as {failed:true} so a broken deck doesn't refetch every render;
-   * re-toggling the layer clears the failure and retries. */
-  _fetchModels(key, sid) {
+  /* Generic on-demand layer fetch (E4 models / E5 surge + wind history):
+   * requested over the layer websocket only while the layer is selected,
+   * client-cached per (layer, storm, advisory). Failures are cached as
+   * {failed:true} so a dead layer doesn't refetch every render; re-selecting
+   * the layer clears the failure and retries. */
+  _fetchLayer(layer, key, sid) {
     if (this._layerBusy[key] || !this._hass) return;
     this._layerBusy[key] = true;
-    this._hass.callWS({ type: WS_LAYER_TYPE, storm_id: sid, layer: "models" }).then((res) => {
+    this._hass.callWS({ type: WS_LAYER_TYPE, storm_id: sid, layer }).then((res) => {
       delete this._layerBusy[key];
-      this._layerCache[key] = (res && res.ok && res.models && res.models.length)
-        ? res : { failed: true };
+      this._layerCache[key] = (res && res.ok) ? res : { failed: true };
       this._render();
     }).catch(() => {
       delete this._layerBusy[key];
       this._layerCache[key] = { failed: true };
       this._render();
     });
+  }
+
+  /* Resolve one on-demand layer's draw state for the current storm: the cached
+   * result, a cached failure, or {loading:true} while a fetch is kicked off. */
+  _layerState(layer, st) {
+    const key = `${layer}|${st.stormId || ""}|${st.advisory || ""}`;
+    const c = this._layerCache[key];
+    if (c && c.ok) return c;
+    if (c && c.failed) return { failed: true };
+    this._fetchLayer(layer, key, st.stormId || "");
+    return { loading: true };
+  }
+
+  /* Apply a tri-group change (slider or side-label tap). Re-selecting surge
+   * clears its cached failures so the fetch retries fresh (models pattern). */
+  _applyTri(key, v) {
+    if (!key || !(v === "left" || v === "off" || v === "right")) return;
+    this._layerPrefs = setTriPref(this._layerPrefs || {}, key, v);
+    if (key === "stripe" && v === "right")
+      for (const k of Object.keys(this._layerCache))
+        if (k.startsWith("surge|") && this._layerCache[k].failed) delete this._layerCache[k];
+    this._render();
   }
 
   _msg(icon, title, sub, spin) {
@@ -1059,32 +1343,53 @@ class HurricaneCard extends HTMLElement {
       // E4 model tracks: resolve this storm's layer state for the draw --
       // cached list, cached failure, or kick an on-demand fetch (loading).
       // NHC-only; the toggle is disabled for GDACS storms below.
+      const nhcSt = isNhcId(st.stormId);
       let modelState = null;
-      if (prefs.models && isNhcId(st.stormId)) {
-        const mkey = `models|${st.stormId || ""}|${st.advisory || ""}`;
-        const mc = this._layerCache[mkey];
-        if (mc && mc.ok) modelState = { list: mc.models };
-        else if (mc && mc.failed) modelState = { failed: true };
-        else { modelState = { loading: true }; this._fetchModels(mkey, st.stormId || ""); }
+      if (prefs.models && nhcSt) {
+        const ms = this._layerState("models", st);
+        modelState = ms.ok ? { list: ms.models } : ms;
       }
-      let svg = "";
+      // E5 on-demand layers on the same cache/fetch path: storm surge draws
+      // when the coastal-stripe tri sits RIGHT; the wind-history trail is an
+      // independent toggle. Both NHC-only.
+      const lay = { surge: null, whist: null };
+      if (nhcSt && triState(prefs, "stripe") === "right")
+        lay.surge = this._layerState("surge", st);
+      if (nhcSt && prefs.wind_history)
+        lay.whist = this._layerState("wind_history", st);
+      let svg = "", popImpact = null;
       this._labelCtx = null;   // E6: engine context, set only on a successful build
       try {
-        const built = buildConeSvg(st, cfg, modelState, prefs);
+        const built = buildConeSvg(st, cfg, modelState, prefs, lay);
         svg = built.svg;
         this._labelCtx = built.ctx;
+        popImpact = built.popImpact;
       }
       catch (e) { svg = this._msg("mdi:map-marker-alert", "Couldn\u2019t draw this storm", "", false); }
       // Map chrome: recenter (zoom), the advisory doc button (only when that
       // layer is on), and the gear that opens the layers panel. The panel lists
       // OPTIONAL_LAYERS grouped by topic; the advisory overlay covers the whole
       // card and survives background re-renders via instance state.
+      // E5 panel: the three-way sibling sliders first (left = default sibling,
+      // middle = off, right = alternate), then the independent toggles, with
+      // advisory text LAST; a short perf note closes the panel.
       let panelRows = "", lastGroup = null;
+      for (const t of TRI_GROUPS) {
+        const na = t.nhcOnly && !nhcSt;
+        const v = na ? t.def : triState(prefs, t.key);
+        const seg = (set, lbl) =>
+          `<button class="hu-seg-btn${v === set ? " hu-sel" : ""}" data-tri="${t.key}" data-set="${set}"${na ? " disabled" : ""}>${esc(lbl)}</button>`;
+        panelRows += `<div class="hu-panel-group">${esc(t.title)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}</div>
+          <div class="hu-seg${na ? " hu-na" : ""}" role="group" aria-label="${esc(t.title)}">
+            ${seg("left", t.lLabel)}${seg("off", "Off")}${seg("right", t.rLabel)}
+          </div>`;
+      }
       for (const l of OPTIONAL_LAYERS) {
         if (l.group !== lastGroup) { panelRows += `<div class="hu-panel-group">${esc(l.group)}</div>`; lastGroup = l.group; }
-        const na = l.nhcOnly && !isNhcId(st.stormId);
-        panelRows += `<label class="hu-panel-row${na ? " hu-na" : ""}"><input type="checkbox" data-layer="${l.id}" ${prefs[l.id] && !na ? "checked" : ""}${na ? " disabled" : ""}/> ${esc(l.label)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}</label>`;
+        const na = l.nhcOnly && !nhcSt;
+        panelRows += `<label class="hu-panel-row${na ? " hu-na" : ""}"><span class="hu-row-lbl">${esc(l.label)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}</span><input type="checkbox" class="hu-sw" data-layer="${l.id}" ${prefs[l.id] && !na ? "checked" : ""}${na ? " disabled" : ""}/></label>`;
       }
+      panelRows += `<div class="hu-panel-perf">Turn off what you don’t need — fewer layers means a faster card.</div>`;
       const tools = `<div class="hu-tools">
           <button class="hu-recenter" aria-label="Recenter map"><ha-icon icon="mdi:image-filter-center-focus"></ha-icon>Recenter</button>
           ${prefs.advisory ? `<button class="hu-toolbtn hu-doc" aria-label="Advisory text" title="Advisory text"><ha-icon icon="mdi:text-box-outline"></ha-icon></button>` : ""}
@@ -1097,7 +1402,7 @@ class HurricaneCard extends HTMLElement {
           <div class="hu-adv-body">${this._advBody || ""}</div></div>` : "";
       body = `<div class="hu-tag">${esc(tagName)}</div>
         <div class="hu-conewrap">${svg}${tools}</div>
-        <div class="hu-bar">${dataBar(st)}</div>${exposureTimeline(st, cfg)}${pager}${stale}${adv}`;
+        <div class="hu-bar">${dataBar(st, lay, popImpact)}</div>${exposureTimeline(st, cfg)}${pager}${stale}${adv}`;
     } else if (d.reason === "none_matched") {
       const n = d.activeAnywhere || 0;
       body = this._msg("mdi:map-marker-off", "No storms near you",
@@ -1148,12 +1453,17 @@ class HurricaneCard extends HTMLElement {
         const id = el.getAttribute("data-layer");
         this._layerPrefs = setLayerPref(this._layerPrefs || {}, id, el.checked);
         if (id === "advisory" && !el.checked) this._advOpen = false;
-        // Re-toggling models clears cached failures so the fetch retries fresh.
-        if (id === "models" && el.checked)
+        // Re-toggling a fetching layer clears cached failures -> fresh retry.
+        if ((id === "models" || id === "wind_history") && el.checked)
           for (const k of Object.keys(this._layerCache))
-            if (k.startsWith("models|") && this._layerCache[k].failed) delete this._layerCache[k];
+            if (k.startsWith(id + "|") && this._layerCache[k].failed) delete this._layerCache[k];
         this._render();
       }));
+    // E5 tri-group segmented buttons (Material 3 pattern: one segment per
+    // state, selected segment filled -- "Off" is its own labeled segment).
+    this.shadowRoot.querySelectorAll(".hu-seg-btn").forEach((el) =>
+      el.addEventListener("click", () =>
+        this._applyTri(el.getAttribute("data-tri"), el.getAttribute("data-set"))));
     const doc = this.shadowRoot.querySelector(".hu-doc");
     doc && doc.addEventListener("click", () => this._openAdvisory());
     const closeBtn = this.shadowRoot.querySelector(".hu-adv-close");

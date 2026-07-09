@@ -188,6 +188,28 @@ def _dp(pts, tol):
     return [pts[i] for i, k in enumerate(keep) if k]
 
 
+def simplify_rings(rings, tol, budget=None):
+    """DP-simplify a list of [[lng, lat], ...] rings (degrees). Drops rings that
+    degenerate below 4 points. If `budget` is set and the total point count is
+    over it, the tolerance coarsens (tol *= 1.7, same backoff as the zoom clip)
+    and the pass re-runs -- a hard bound so an on-demand layer (E5 surge /
+    wind-history rings) can never blow up a websocket payload."""
+    if not rings:
+        return []
+    for _ in range(8):
+        out = []
+        total = 0
+        for r in rings:
+            s = _dp([tuple(p) for p in r], tol)
+            if len(s) >= 4:
+                out.append([[round(x, 4), round(y, 4)] for x, y in s])
+                total += len(s)
+        if budget is None or total <= budget or not out:
+            return out
+        tol *= 1.7
+    return out
+
+
 def clip_basemap(basemap, bbox, pad, ref_span=None, budget=None, cap_bytes=None):
     """Decode the in-view parts of each layer and simplify to a point budget.
     Coastlines get finer detail when zoomed in and thin out when zoomed out; the
@@ -676,10 +698,18 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     # geographic hu-pan group, so panning reveals them like the coastline),
     # biggest population first, capped so a metro-dense frame stays light. The
     # card handles label declutter; a v2 basemap yields [] and nothing draws.
-    places = sorted(basemap.places_in(view_box), key=lambda p: -p["pop"])[:CITY_DOT_CAP]
+    all_places = basemap.places_in(view_box)
+    places = sorted(all_places, key=lambda p: -p["pop"])[:CITY_DOT_CAP]
     places = [{"name": p["name"], "lng": round(p["lng"], 4),
                "lat": round(p["lat"], 4), "pop": p["pop"], "rank": p["rank"]}
               for p in places]
+    # E5 population-density grid: EVERY in-view place as a compact [lng,lat,pop]
+    # triple (no names -- the density picture doesn't label). The card's
+    # Population dot mode draws all of them and sums the population inside the
+    # cone. ~25 KB on a metro-dense frame (843 places over East Asia); rides
+    # outside the geo byte cap by design -- it's data, not coastline.
+    pop_grid = [[round(p["lng"], 3), round(p["lat"], 3), p["pop"]]
+                for p in all_places]
 
     cur_lat = storm.get("latitudeNumeric")
     cur_lng = storm.get("longitudeNumeric")
@@ -831,5 +861,6 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "geo": geo,
         "labels": labels,
         "places": places,
+        "popGrid": pop_grid,
         "meta": meta,
     }
