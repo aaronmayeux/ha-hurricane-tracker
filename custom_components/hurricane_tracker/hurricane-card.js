@@ -58,13 +58,16 @@ function setTriPref(prefs, key, v) {
   return prefs;
 }
 /* Population-scaled dot radius (E5 pop-density rendering): RELATIVE to the
- * places in the current frame -- biggest drawn city = 9px, smallest = 2.2px,
- * sqrt-interpolated (area-proportional between the frame's extremes). Two
- * absolute ramps were tried and BOTH flattened out (log compressed everything
- * to a 1-2px spread; absolute-sqrt capped every 1.5M+ metro at 9px, and in a
- * metro-dense frame like East Asia the top-N selection is ALL 1.5M+ metros).
- * Per-frame normalization is standard graduated-symbol practice and shows the
- * full size range in every region; don't go back to an absolute ramp. */
+ * places in the current frame -- biggest drawn place = POP_DOT_MAX_R px,
+ * smallest = POP_DOT_MIN_R px, sqrt-interpolated (area-proportional between
+ * the frame's extremes). Two absolute ramps were tried and BOTH flattened out
+ * (log compressed everything to a 1-2px spread; absolute-sqrt capped every
+ * 1.5M+ metro at 9px, and in a metro-dense frame like East Asia the top-N
+ * selection is ALL 1.5M+ metros). Per-frame normalization is standard
+ * graduated-symbol practice and shows the full size range in every region;
+ * don't go back to an absolute ramp. */
+const POP_DOT_MIN_R = 1.2;   // px radius of the frame's smallest place
+const POP_DOT_MAX_R = 9.0;   // px radius of the frame's biggest place
 function popScaler(pops) {
   let lo = Infinity, hi = 0;
   for (const n of pops) {
@@ -74,9 +77,9 @@ function popScaler(pops) {
   }
   const span = hi - lo;
   return (pop) => {
-    if (span <= 0) return 4.5;   // degenerate frame (all same pop) -> midsize
+    if (span <= 0) return (POP_DOT_MIN_R + POP_DOT_MAX_R) / 2;   // degenerate frame (all same pop)
     const v = Math.sqrt(Math.max(Number(pop) || 0, 1));
-    return 1.6 + 7.4 * ((v - lo) / span);
+    return POP_DOT_MIN_R + (POP_DOT_MAX_R - POP_DOT_MIN_R) * ((v - lo) / span);
   };
 }
 /* Min px distance from a point to a polygon/polyline (0 when inside a
@@ -100,8 +103,8 @@ function distToPoly(x, y, poly) {
  * out. Per-dot opacity is the cheap equivalent of a blur-out -- an actual SVG
  * gaussian filter over hundreds of circles would wreck phone GPUs. Dots that
  * fade below POP_ALPHA_MIN are skipped entirely (fewer DOM nodes). */
-const POP_FADE_SIGMA = 112;   // was 90; +25% visible radius (Aaron, 2026-07-08)
-const POP_BASE_ALPHA = 0.64;   // ~20% more transparent than the first cut (.8)
+const POP_FADE_SIGMA = 100;   // fade falloff px from the cone (Aaron, 2026-07-09)
+const POP_BASE_ALPHA = 0.7;    // dot opacity at the cone (Aaron, 2026-07-09)
 const POP_ALPHA_MIN = 0.04;
 /* Compact population figure for the data bar: 34M / 3.4M / 820k. */
 const fmtPop = (n) => n >= 1e6 ? ((n / 1e6 >= 10 ? Math.round(n / 1e6) : (n / 1e6).toFixed(1)) + "M")
@@ -593,8 +596,9 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // Place dots, two very different modes:
   // - Cities (left): top CITY_DOT_DRAW places as uniform labeled dots via the
   //   zoom-label engine -- the classic navigational look.
-  // - Population (right): the DENSITY picture. Every mapped place in the
-  //   buffered view (popGrid, typically hundreds), dot AREA scaled relative to
+  // - Population (right): the DENSITY picture. The mapped places in the
+  //   buffered view (popGrid, capped server-side at POP_GRID_CAP -- a dense
+  //   frame arrives pre-aggregated per grid cell), dot AREA scaled relative to
   //   the frame's extremes, freely overlapping. Drawn as plain circles in
   //   hu-pan so they zoom with the coastline (a density surface, not
   //   furniture) -- this also keeps the gesture loop free of hundreds of
@@ -806,9 +810,10 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
   }
 
-  // E5 population impact: sum the mapped-city population inside the forecast
+  // E5 population impact: sum the mapped-place population inside the forecast
   // cone (Population mode only). An undercount by construction -- the basemap
-  // only carries places >= 25k -- so the data bar labels it "mapped cities".
+  // only carries places >= 5k (GeoNames cities5000) -- so the data bar labels
+  // it "mapped cities".
   let popImpact = null;
   if (gridPts && conePx.length >= 3) {
     popImpact = 0;
@@ -906,7 +911,7 @@ function dataBar(st, lay, popImpact) {
   if (lay && lay.surge && lay.surge.ok && lay.surge.atHome)
     bits.push(`surge at home: ${lay.surge.atHome}`);
   // E5 population impact (Population dot mode): honest about the undercount --
-  // only mapped places (>= 25k) are summed.
+  // only mapped places (>= 5k, GeoNames) are summed.
   if (popImpact != null && popImpact > 0)
     bits.push(`~${fmtPop(popImpact)} people in the cone (mapped cities)`);
   let peak = "";

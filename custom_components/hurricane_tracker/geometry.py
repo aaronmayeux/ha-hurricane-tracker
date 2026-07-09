@@ -20,6 +20,9 @@ import struct
 from .const import (
     BASIN_NAME,
     CITY_DOT_CAP,
+    POP_GRID_CAP,
+    POP_GRID_MIN_POP,
+    POP_GRID_START_DIV,
     UNIT_KM,
     ZOOM_BUFFER_FACTOR,
     ZOOM_MAX_SCALE,
@@ -138,6 +141,45 @@ class _Basemap:
             out.append({"name": name, "lng": x / q, "lat": y / q,
                         "rank": rank, "pop": pop})
         return out
+
+
+def _thin_pop_grid(places, view_box):
+    """popGrid entries for the card: compact [lng, lat, pop] triples.
+
+    At or under POP_GRID_CAP places, everything passes through untouched (true
+    positions). Over the cap, places are aggregated per grid cell: each
+    occupied cell becomes ONE entry at the pop-WEIGHTED centroid of its
+    members (a centroid, not the cell center -- a cell-center grid reads as a
+    visible lattice) carrying the summed population. The cell size starts at
+    1/POP_GRID_START_DIV of the view's larger span and doubles until the
+    occupied-cell count fits the cap, so resolution degrades only as far as
+    the frame's density forces it. The card is agnostic: its per-frame
+    relative dot scaling, cone fade, and in-cone population sum all operate on
+    [lng,lat,pop] triples whether a triple is one town or a merged cell.
+    POP_GRID_MIN_POP floors the input BEFORE aggregation (0 = everything in
+    the basemap; 25000 mimics the pre-GeoNames Natural Earth density)."""
+    pts = ([p for p in places if p["pop"] >= POP_GRID_MIN_POP]
+           if POP_GRID_MIN_POP > 0 else places)
+    if len(pts) <= POP_GRID_CAP:
+        return [[round(p["lng"], 3), round(p["lat"], 3), p["pop"]] for p in pts]
+    span = max(view_box[2] - view_box[0], view_box[3] - view_box[1], 1e-6)
+    cell = span / POP_GRID_START_DIV
+    while True:
+        cells = {}
+        for p in pts:
+            w = max(p["pop"], 1)
+            k = (math.floor(p["lng"] / cell), math.floor(p["lat"] / cell))
+            c = cells.get(k)
+            if c is None:
+                cells[k] = [w, p["lng"] * w, p["lat"] * w]
+            else:
+                c[0] += w
+                c[1] += p["lng"] * w
+                c[2] += p["lat"] * w
+        if len(cells) <= POP_GRID_CAP:
+            return [[round(sx / w, 3), round(sy / w, 3), w]
+                    for (w, sx, sy) in cells.values()]
+        cell *= 2.0
 
 
 _basemap_cache = None
@@ -703,13 +745,15 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     places = [{"name": p["name"], "lng": round(p["lng"], 4),
                "lat": round(p["lat"], 4), "pop": p["pop"], "rank": p["rank"]}
               for p in places]
-    # E5 population-density grid: EVERY in-view place as a compact [lng,lat,pop]
-    # triple (no names -- the density picture doesn't label). The card's
+    # E5 population-density grid: in-view places as compact [lng,lat,pop]
+    # triples (no names -- the density picture doesn't label). The card's
     # Population dot mode draws all of them and sums the population inside the
-    # cone. ~25 KB on a metro-dense frame (843 places over East Asia); rides
+    # cone. The GeoNames basemap (v0.3.0, ~64k places >= 5k pop) can put 10k+
+    # places in a metro-dense buffered frame -- too many for the websocket or
+    # the DOM -- so _thin_pop_grid caps the list at POP_GRID_CAP (sparse frames
+    # pass through untouched; dense frames aggregate per grid cell). Rides
     # outside the geo byte cap by design -- it's data, not coastline.
-    pop_grid = [[round(p["lng"], 3), round(p["lat"], 3), p["pop"]]
-                for p in all_places]
+    pop_grid = _thin_pop_grid(all_places, view_box)
 
     cur_lat = storm.get("latitudeNumeric")
     cur_lng = storm.get("longitudeNumeric")

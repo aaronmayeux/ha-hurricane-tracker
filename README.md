@@ -29,8 +29,8 @@ you automatically — no manual dashboard resource to add.
   toward home when it's outside the frame, and a far-offshore mileage scale.
 - Distance from your home, current intensity, movement, and peak forecast
   category.
-- Bundled offline global basemap built from Natural Earth (no map tiles, no API
-  keys).
+- Bundled offline global basemap built from Natural Earth and GeoNames (no map
+  tiles, no API keys).
 - **Auto-themes to your dashboard** — every color follows your active Home
   Assistant theme out of the box, and any of them can be overridden per card.
 - Miles/mph or kilometers/km-h.
@@ -118,7 +118,7 @@ show_scale: false
 | `show_land` | Land fill. |
 | `show_coast` | Coastlines. |
 | `show_states` | State/province border lines. |
-| `show_cities` | City dots + names (populated places from Natural Earth, biggest first). |
+| `show_cities` | City dots + names (populated places from GeoNames, biggest first). |
 | `show_labels` | Region/country name labels. |
 | `show_scale` | Far-offshore mileage scale (only appears when home is off-frame). |
 | `show_home` | Home marker. |
@@ -139,7 +139,7 @@ so one draws at a time (left = default, middle = off, right = the alternate):
 | Group | Left (default) | Right | Notes |
 |---|---|---|---|
 | Wind field | Current-position 34/50/64 kt field | Full-track wind swath | `show_winds` card config is the master on/off. |
-| Place dots | City dots + names (top places) | Population density — every mapped place, dot size scaled by population, fading with distance from the projected path; adds a "~X people in the cone" line to the data bar (mapped places ≥ 25k only, so it's an undercount) | `show_cities` card config is the master on/off. |
+| Place dots | City dots + names (top places) | Population density — the mapped places in view, dot size scaled by population, fading with distance from the projected path; adds a "~X people in the cone" line to the data bar (mapped places with population ≥ 5,000 only, so it's an undercount) | `show_cities` card config is the master on/off. |
 | Coastal stripe | Watch/warning segments | Peak storm surge inundation bands + "surge at home" (fetched on demand) | Atlantic/East Pacific/Central Pacific storms only. |
 
 **On-demand layers:**
@@ -305,10 +305,14 @@ attributes carry GDACS's own official alert data — absent on NHC storms:
   uncertainty circles, so those basins carry slightly coarser per-point detail
   than NHC's.
 - **Basemap** — coastlines, land, and admin-1 border lines from
-  [Natural Earth](https://www.naturalearthdata.com/) (public domain).
+  [Natural Earth](https://www.naturalearthdata.com/) (public domain); city and
+  town points (names, positions, populations) from the
+  [GeoNames](https://www.geonames.org/) cities5000 dataset, licensed under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 Sources are polled every 30 minutes. This project is not affiliated with or
-endorsed by NOAA/NHC, GDACS, the European Commission, or Natural Earth.
+endorsed by NOAA/NHC, GDACS, the European Commission, Natural Earth, or
+GeoNames.
 
 ## License
 

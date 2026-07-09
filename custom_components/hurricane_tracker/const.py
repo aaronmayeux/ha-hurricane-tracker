@@ -208,14 +208,31 @@ ZOOM_BUFFER_FACTOR = 2.0     # buffered extent = this * the default frame, about
 ZOOM_POINT_BUDGET = 20000    # simplification ceiling for the buffered clip (a cap, not a target)
 ZOOM_PAYLOAD_CAP_BYTES = 400000  # hard cap on the serialized geo; back off tolerance until under
 ZOOM_MAX_SCALE = 3.0         # card zoom-in limit (past this the DP coastline reads chunky)
-# Max places per payload (top-N by pop_max in the buffered view). The card
-# slices this: Cities mode draws the top CITY_DOT_DRAW (uniform dots, the
-# pre-E5 look); Population mode draws ALL of them, area-scaled by pop -- the
-# density picture needs the small towns, not just metros (~30 bytes/place,
-# so 120 is ~4 KB against a ~300 KB payload). The 25k pop floor is pack-time
-# (basemap.bin --min-pop); below that simply isn't in the file.
+# Max NAMED places per payload (top-N by pop in the buffered view). The card's
+# Cities mode draws the top CITY_DOT_DRAW of these as uniform labeled dots;
+# Population mode ignores this list and draws the (unnamed) popGrid instead.
 CITY_DOT_CAP = 120
 CITY_DOT_DRAW = 30           # Cities-mode draw cap (card-side slice)
+
+# --- population-density grid (popGrid) knobs (v0.3.0) ------------------------
+# The basemap places layer is GeoNames cities5000 (~64k places, pop >= 5000,
+# CC-BY 4.0 -- attribution lives in the README) as of v0.3.0; it was Natural
+# Earth populated_places (~5.2k, >= 25k) before. popGrid ships every in-view
+# place UNLESS the count tops POP_GRID_CAP, in which case geometry's
+# _thin_pop_grid aggregates per grid cell (pop-weighted centroid + summed pop)
+# until it fits. Tuning:
+#   POP_GRID_CAP       payload/DOM ceiling. Higher = finer density picture,
+#                      heavier websocket payload + more SVG circles per frame.
+#   POP_GRID_MIN_POP   payload-side population floor applied BEFORE
+#                      aggregation. 0 = everything in the file. 25000 mimics
+#                      the old Natural-Earth-era look without touching
+#                      basemap.bin (the quick "don't like it" revert knob).
+#   POP_GRID_START_DIV initial aggregation cell = view span / this. Bigger =
+#                      finer starting cells (denser result before the cap
+#                      forces coarsening); each retry doubles the cell.
+POP_GRID_CAP = 2000
+POP_GRID_MIN_POP = 0
+POP_GRID_START_DIV = 128
 
 # --- frontend ---------------------------------------------------------------
 CARD_FILENAME = "hurricane-card.js"
