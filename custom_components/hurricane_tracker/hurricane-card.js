@@ -43,7 +43,6 @@ const OPTIONAL_LAYERS = [
  * storms and fall back to their left/default state. */
 const TRI_GROUPS = [
   { key: "wind",   title: "Wind field",     lLabel: "Current",    rLabel: "Swath",      def: "left", master: "show_winds" },
-  { key: "dots",   title: "Place dots",     lLabel: "Cities",     rLabel: "Population", def: "left", master: "show_cities" },
   { key: "stripe", title: "Coastal stripe", lLabel: "Watch/warn", rLabel: "Surge",      def: "left", nhcOnly: true },
 ];
 function triState(prefs, key) {
@@ -69,17 +68,23 @@ function setTriPref(prefs, key, v) {
 const POP_DOT_MIN_R = 1.2;   // px radius of the frame's smallest place
 const POP_DOT_MAX_R = 9.0;   // px radius of the frame's biggest place
 function popScaler(pops) {
-  let lo = Infinity, hi = 0;
-  for (const n of pops) {
-    const v = Math.sqrt(Math.max(Number(n) || 0, 1));
-    if (v < lo) lo = v;
-    if (v > hi) hi = v;
-  }
+  const vs = [];
+  for (const n of pops) vs.push(Math.sqrt(Math.max(Number(n) || 0, 1)));
+  vs.sort((a, b) => a - b);
+  const lo = vs.length ? vs[0] : 0;
+  // Normalize against a high PERCENTILE, not the absolute max: a few giant metros
+  // (LA, NYC) otherwise anchor the top and crush every ordinary city into the
+  // floor, so a metro-dense frame reads as uniform dots (Aaron, 2026-07-17).
+  // Places at/above the percentile clamp to POP_DOT_MAX_R; everyone below spreads
+  // across the full range. Still per-frame (relative), just outlier-robust -- NOT
+  // an absolute ramp (those flattened; see history).
+  const hi = vs.length ? vs[Math.floor((vs.length - 1) * 0.92)] : 0;
   const span = hi - lo;
   return (pop) => {
     if (span <= 0) return (POP_DOT_MIN_R + POP_DOT_MAX_R) / 2;   // degenerate frame (all same pop)
     const v = Math.sqrt(Math.max(Number(pop) || 0, 1));
-    return POP_DOT_MIN_R + (POP_DOT_MAX_R - POP_DOT_MIN_R) * ((v - lo) / span);
+    const t = Math.min(1, (v - lo) / span);
+    return POP_DOT_MIN_R + (POP_DOT_MAX_R - POP_DOT_MIN_R) * t;
   };
 }
 /* Min px distance from a point to a polygon/polyline (0 when inside a
@@ -140,6 +145,15 @@ function loadLayerPrefs() {
   // Migrate the pre-E5 wind_swath boolean into the wind tri-state.
   if (!p.tri) { p.tri = {}; if (p.wind_swath) p.tri.wind = "right"; }
   delete p.wind_swath;
+  // Split the old three-way "dots" slider into two independent toggles so
+  // Cities + Population can show at once. Migrate once: left -> cities only,
+  // right -> population only, off -> neither; new users default to Cities on.
+  if (p.dotsCities === undefined && p.dotsPop === undefined) {
+    const od = p.tri && p.tri.dots;
+    p.dotsCities = od ? od === "left" : true;
+    p.dotsPop = od === "right";
+  }
+  if (p.tri) delete p.tri.dots;
   return p;
 }
 function saveLayerPrefs(p) {
@@ -364,9 +378,9 @@ function houseGlyph(cx, cy) {
  * home. Direction is derived from the clamped position every time, so it aims
  * correctly from any edge or corner. Distance labeled further inboard. */
 const EDGE_M = 50;
-function homeEdgeMarker(hx, hy, m) {
-  const cx = Math.max(EDGE_M, Math.min(VBW - EDGE_M, hx));
-  const cy = Math.max(EDGE_M, Math.min(VBH - EDGE_M, hy));
+function homeEdgeMarker(hx, hy, m, clampX, clampY) {
+  const cx = clampX != null ? clampX : Math.max(EDGE_M, Math.min(VBW - EDGE_M, hx));
+  const cy = clampY != null ? clampY : Math.max(EDGE_M, Math.min(VBH - EDGE_M, hy));
   let ux = hx - cx, uy = hy - cy;
   const len = Math.hypot(ux, uy) || 1;
   ux /= len; uy /= len;                 // unit vector, house -> true home (outboard)
@@ -536,7 +550,11 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // carries no ww segments, so that draws nothing there anyway.
   const nhcStorm = isNhcId(st.stormId);
   const triWind = cfg.show_winds === false ? "off" : triState(prefs, "wind");
-  const triDots = cfg.show_cities === false ? "off" : triState(prefs, "dots");
+  // Place dots: two INDEPENDENT modes now (both can be on). show_cities config
+  // is the dashboard master gate for both; per-mode state is a viewer pref.
+  const dotsOn = cfg.show_cities !== false;
+  const dotsCities = dotsOn && prefs.dotsCities !== false;
+  const dotsPop = dotsOn && prefs.dotsPop === true;
   const triStripe = nhcStorm ? triState(prefs, "stripe") : "left";
   const proj = makeProject(st.bbox);
   const conePx = (st.cone || []).map((c) => proj(c[0], c[1]));
@@ -547,7 +565,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
       if (part.length >= 3) base.push(`<path class="hu-land" d="${basePath(proj, part, true, smooth)}"/>`);
   if (cfg.show_states !== false)
     for (const part of (st.geo && st.geo.states) || [])
-      if (part.length >= 2) base.push(`<path class="hu-state" d="${basePath(proj, part, false, smooth)}"/>`);
+      if (part.length >= 2) base.push(`<path class="hu-state" d="${basePath(proj, part, false, false)}"/>`);   // political borders drawn straight (never curve-smoothed)
   if (cfg.show_coast !== false)
     for (const part of (st.geo && st.geo.coast) || [])
       if (part.length >= 2) base.push(`<path class="hu-coast" d="${basePath(proj, part, false, smooth)}"/>`);
@@ -607,12 +625,13 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   const ctxCities = [];
   const gridDots = [];
   let gridPts = null;   // [x, y, pop] px points for the in-cone impact sum
-  if (triDots === "left" && st.places && st.places.length) {
+  if (dotsCities && st.places && st.places.length) {
     for (const p of st.places.slice(0, CITY_DOT_DRAW)) {
       const [x, y] = proj(normLng(p.lng), p.lat);
       ctxCities.push({ name: p.name, x, y, r: 2.6, cls: "hu-city" });
     }
-  } else if (triDots === "right") {
+  }
+  if (dotsPop) {
     const grid = (st.popGrid && st.popGrid.length)
       ? st.popGrid : (st.places || []).map((p) => [p.lng, p.lat, p.pop]);
     if (grid.length) {
@@ -736,9 +755,17 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     } else {
       // Off-frame: clamp the house to the edge at home's projected position; the
       // chevron points from the house center straight at home.
-      homeParts.push(homeEdgeMarker(hx, hy, st.meta || {}));
       hcx = Math.max(EDGE_M, Math.min(VBW - EDGE_M, hx));
       hcy = Math.max(EDGE_M, Math.min(VBH - EDGE_M, hy));
+      // Keep clear of the top-right control cluster (Recenter/advisory/gear) --
+      // HTML furniture painted OVER the SVG, so the marker would draw behind it.
+      // Slide the clamp out of that corner: down the right edge for a home off to
+      // the right, else left along the top edge.
+      const TK_X1 = VBW - 120, TK_Y2 = 58;
+      if (hcx > TK_X1 && hcy < TK_Y2) {
+        if (hx > VBW) hcy = TK_Y2 + 8; else hcx = TK_X1 - 8;
+      }
+      homeParts.push(homeEdgeMarker(hx, hy, st.meta || {}, hcx, hcy));
       // keep-out AABB covering the whole marker (house + chevron + distance label)
       // so region labels and the scale avoid it -- collision rules apply to it too.
       let ux = hx - hcx, uy = hy - hcy;
@@ -871,10 +898,14 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
 function dataBar(st, lay, popImpact) {
   const m = st.meta || {};
   let name = (m.name || "Storm").replace(/\s*\([^)]*\)\s*$/, "").trim();
+  // Storm type now lives in the top header; strip it from the name so the bar
+  // title reads just the name + classification tag (e.g. "Elida (TS)").
+  if (m.type && name.toLowerCase().startsWith(m.type.toLowerCase()))
+    name = name.slice(m.type.length).trim();
   const tag = catLabel(m.cat);
   if (tag) name = `${name} (${tag})`;
   const bits = [];
-  if (m.type) bits.push(m.type);
+  // m.type intentionally omitted here -- it's shown in the top header now.
   if (m.wind != null) { let s = `${m.wind} ${m.windUnit}`; if (m.gust != null) s += ` (gust ${m.gust})`; bits.push(s); }
   if (m.moveText) bits.push(m.moveText);
   // Distance line + closest approach, kept on ONE basis so "closest" can't read
@@ -1343,7 +1374,7 @@ class HurricaneCard extends HTMLElement {
           <span class="hu-page">${this._idx + 1} / ${storms.length}</span>
           <button data-nav="1" aria-label="Next storm">\u203a</button></div>`;
       }
-      const tagName = cfg.title != null ? cfg.title : `Hurricane \u00b7 ${(st.meta && st.meta.basinName) || ""}`;
+      const tagName = cfg.title != null ? cfg.title : `${(st.meta && st.meta.type) || "Storm"} \u00b7 ${(st.meta && st.meta.basinName) || ""}`;
       const prefs = this._layerPrefs || {};
       // E4 model tracks: resolve this storm's layer state for the draw --
       // cached list, cached failure, or kick an on-demand fetch (loading).
@@ -1388,6 +1419,17 @@ class HurricaneCard extends HTMLElement {
           <div class="hu-seg${na ? " hu-na" : ""}" role="group" aria-label="${esc(t.title)}">
             ${seg("left", t.lLabel)}${seg("off", "Off")}${seg("right", t.rLabel)}
           </div>`;
+      }
+      // Place dots: two INDEPENDENT toggles (Cities + Population can both be on),
+      // client-only re-renders -> a distinct data-dot attr keeps them off the
+      // lazy-fetch path the OPTIONAL_LAYERS checkboxes use below.
+      {
+        const dna = cfg.show_cities === false;
+        const dotRow = (id, lbl, on) =>
+          `<label class="hu-panel-row${dna ? " hu-na" : ""}"><span class="hu-row-lbl">${esc(lbl)}</span><input type="checkbox" class="hu-sw" data-dot="${id}" ${on && !dna ? "checked" : ""}${dna ? " disabled" : ""}/></label>`;
+        panelRows += `<div class="hu-panel-group">Place dots</div>`
+          + dotRow("cities", "Cities", prefs.dotsCities !== false)
+          + dotRow("population", "Population", prefs.dotsPop === true);
       }
       for (const l of OPTIONAL_LAYERS) {
         if (l.group !== lastGroup) { panelRows += `<div class="hu-panel-group">${esc(l.group)}</div>`; lastGroup = l.group; }
@@ -1462,6 +1504,15 @@ class HurricaneCard extends HTMLElement {
         if ((id === "models" || id === "wind_history") && el.checked)
           for (const k of Object.keys(this._layerCache))
             if (k.startsWith(id + "|") && this._layerCache[k].failed) delete this._layerCache[k];
+        this._render();
+      }));
+    // Place-dot toggles (Cities / Population): client-only re-render, no fetch.
+    this.shadowRoot.querySelectorAll("input[data-dot]").forEach((el) =>
+      el.addEventListener("change", () => {
+        const key = el.getAttribute("data-dot") === "cities" ? "dotsCities" : "dotsPop";
+        this._layerPrefs = this._layerPrefs || {};
+        this._layerPrefs[key] = el.checked;
+        saveLayerPrefs(this._layerPrefs);
         this._render();
       }));
     // E5 tri-group segmented buttons (Material 3 pattern: one segment per

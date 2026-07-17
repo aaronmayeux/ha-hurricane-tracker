@@ -10,7 +10,7 @@ Sources:
   (public domain):
     coast  : ne_10m_coastline.geojson                      (finest NE tier)
     land   : ne_10m_land.geojson
-    states : ne_50m_admin_1_states_provinces_lines.geojson (borders don't need 10m)
+    states : ne_10m_admin_1_states_provinces_lines.geojson (10m: full global coverage incl. Mexico; 50m was sparse)
   Places — GeoNames cities5000 (download.geonames.org/export/dump), licensed
   CC-BY 4.0 — attribution "GeoNames (geonames.org)" REQUIRED wherever the data
   ships (README carries it). ~50k populated places with pop >= 5000, versus the
@@ -72,9 +72,14 @@ LINE_LAYERS = ["coast", "states", "land"]
 NE_SOURCES = {
     "coast":  ("ne_10m_coastline.geojson", "line"),
     "land":   ("ne_10m_land.geojson", "ring"),
-    "states": ("ne_50m_admin_1_states_provinces_lines.geojson", "line"),
+    "states": ("ne_10m_admin_1_states_provinces_lines.geojson", "line"),
 }
 NE_BASE_URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
+# admin-1 lines carry only INTERNAL state/province boundaries; the national
+# perimeter (e.g. the US-Mexico border) lives in admin-0. Merge admin-0 land
+# borders into the states layer so international borders draw too. Land only --
+# the coast layer already draws coastlines, so maritime borders would double up.
+STATES_EXTRA = "ne_10m_admin_0_boundary_lines_land.geojson"
 
 # GeoNames cities5000: every place with population > 5000 (plus admin seats).
 # CC-BY 4.0 — keep the attribution wherever this data ships.
@@ -235,6 +240,8 @@ def main():
     ap.add_argument("--src", default=".", help="dir holding (or to receive) the source files")
     ap.add_argument("--out", required=True, help="output basemap.bin path")
     ap.add_argument("--tol", type=float, default=0.003, help="Douglas-Peucker tol in degrees (0 = lossless)")
+    ap.add_argument("--states-tol", type=float, default=0.01,
+                    help="coarser DP tol for political borders (they re-simplify per view, so this is lossless at storm zoom; keeps the states layer light)")
     ap.add_argument("--min-pop", type=int, default=5000, help="pack-time floor on place population")
     ap.add_argument("--download", action="store_true", help="fetch missing source files into --src")
     ap.add_argument("--keep", action="store_true", help="keep downloaded source files (default: remove)")
@@ -265,8 +272,13 @@ def main():
             fname, kind = NE_SOURCES[name]
             path = ensure(fname, NE_BASE_URL + fname)
             parts = parts_from_geojson(path, kind)
+            layer_tol = args.tol
+            if name == "states":   # merge international land borders in with the state lines
+                ep = ensure(STATES_EXTRA, NE_BASE_URL + STATES_EXTRA)
+                parts = parts + parts_from_geojson(ep, "line")
+                layer_tol = args.states_tol   # borders re-simplify per view -> coarser is lossless
             min_pts = 3 if name == "land" else 2
-            body, nparts, npts = build_layer(parts, min_pts, args.tol)
+            body, nparts, npts = build_layer(parts, min_pts, layer_tol)
             bodies[name] = body
             print(f"  {name:>6}: parts={nparts:>6} points={npts:>8}")
 

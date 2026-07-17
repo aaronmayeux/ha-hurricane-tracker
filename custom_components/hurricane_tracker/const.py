@@ -230,9 +230,9 @@ CITY_DOT_DRAW = 30           # Cities-mode draw cap (card-side slice)
 #   POP_GRID_START_DIV initial aggregation cell = view span / this. Bigger =
 #                      finer starting cells (denser result before the cap
 #                      forces coarsening); each retry doubles the cell.
-POP_GRID_CAP = 2000
+POP_GRID_CAP = 4000
 POP_GRID_MIN_POP = 0
-POP_GRID_START_DIV = 128
+POP_GRID_START_DIV = 256
 
 # --- frontend ---------------------------------------------------------------
 CARD_FILENAME = "hurricane-card.js"
