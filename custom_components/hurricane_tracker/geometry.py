@@ -816,7 +816,11 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
             r = tier["ring"]
             ring = _dp(r, 0.04) if len(r) > 40 else r
         elif tier.get("points"):
-            ring = _corridor_ring(_order_along_track(tier["points"], cur_lng, cur_lat))
+            # NHC tiers are pre-ordered by travel time (past -> current -> forecast);
+            # GDACS tiers keep the nearest-neighbour ordering.
+            seq = (tier["points"] if tier.get("ordered")
+                   else _order_along_track(tier["points"], cur_lng, cur_lat))
+            ring = _corridor_ring(seq)
         if ring and len(ring) >= 3:
             built_swath.append({"kt": tier["kt"], "rings": [ring]})
     # Current field and full-track swath are BOTH emitted now (windField +

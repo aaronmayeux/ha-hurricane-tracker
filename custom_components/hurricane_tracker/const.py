@@ -132,8 +132,10 @@ WIND_RADII_KTS = (34, 50, 64)
 ADECK_URL = "https://ftp.nhc.noaa.gov/atcf/aid_public/a%s.dat.gz"
 # Ordered (tech, human label). TVCN and HCCA are both consensus aids: TVCN is
 # preferred, HCCA is the fallback when TVCN is absent (handled in nhc.py).
+# OFCL is intentionally absent: it IS the official forecast track, which the
+# card always draws as the solid line -- a dashed OFCL overlay was invisible
+# on top of it and redundant in the legend (Aaron, 2026-07-17).
 MODEL_TRACK_TECHS = (
-    ("OFCL", "NHC Official"),
     ("TVCN", "Consensus"),
     ("HCCA", "Consensus"),
     ("AVNO", "GFS"),
@@ -166,16 +168,6 @@ SURGE_POLY_LAYER = 2
 SURGE_ENVELOPE_DEG = 12.0     # +/- degrees around the current position (spatial filter)
 SURGE_OFFSET_DEG = 0.005      # server-side generalization (maxAllowableOffset, degrees)
 SURGE_POINT_BUDGET = 6000     # client-side DP cap across all returned rings
-# Wind history: the per-slot "<slot> Past Wind Radii" layer (AT1 = 14, offset
-# +10 from the slot base -- same deterministic slot-id pattern as Phase 3/4).
-# The 34/50/64 kt field as it was at each PAST advisory; we pull only the
-# 34 kt rings (the growth trail), GEOMETRY included (outSR=4326) -- reading
-# the shipped polygon dodges the where-was-the-center-then problem entirely.
-WIND_HISTORY_OFFSET = 10
-WIND_HISTORY_MAX_ADV = 40     # cap: a long-lived storm carries 40+ advisories
-WIND_HISTORY_OFFSET_DEG = 0.02  # server-side generalization for the rings
-WIND_HISTORY_POINT_BUDGET = 4000  # client-side DP cap across the whole trail
-
 # --- past-track trail -------------------------------------------------------
 # Miles of TRAVEL kept behind the storm, so a fast and a slow storm trail the
 # same physical length on screen (consistent zoom).

@@ -28,7 +28,6 @@ const VBW = 800, VBH = 600;
  * (paid once per advisory, not per glance). */
 const OPTIONAL_LAYERS = [
   { id: "models", label: "Forecast model tracks", group: "Storm info", radio: null, nhcOnly: true },
-  { id: "wind_history", label: "Wind history trail", group: "Storm info", radio: null, nhcOnly: true },
   // Advisory text sits LAST in the panel and is off by default (Aaron's call).
   { id: "advisory", label: "Advisory text", group: "Storm info", radio: null },
 ];
@@ -133,7 +132,7 @@ const isNhcId = (sid) => /^(al|ep|cp)\d/i.test(sid || "");
  * must read as GFS on any theme). HCCA shares TVCN's color: same consensus
  * slot, never drawn together. */
 const MODEL_COLOR = {
-  OFCL: "#EDE3D2", TVCN: "#00E5FF", HCCA: "#00E5FF",
+  TVCN: "#00E5FF", HCCA: "#00E5FF",
   AVNO: "#B388FF", HFSA: "#FFAB40", UKX: "#F06292",
 };
 const modelColor = (id) => MODEL_COLOR[id] || "#9E9E9E";
@@ -426,7 +425,7 @@ function pointInPoly(x, y, poly) {
  * labels) and the cone polygon transform affinely. Screen-space overlay boxes
  * (home marker, model legend) apply only at the default frame -- the overlays
  * are hidden everywhere else. */
-const REGION_CHAR_W = 7.4;
+const REGION_CHAR_W = 8.6;   // ~14px uppercase sans-serif (matches .hu-region)
 /* Nudge offsets tried in order (px). Anchor first, then toward open water nearby. */
 const REGION_NUDGES = [[0, 0], [0, 15], [0, -15], [16, 0], [-16, 0], [0, 28], [0, -28], [22, 14], [-22, 14], [22, -14], [-22, -14], [0, 42], [0, -42]];
 function layoutZoomLabels(ctx, view) {
@@ -670,15 +669,6 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
       if (d) surgeLayer.push(`<path class="hu-surge" style="fill:${surgeColor(b, i)}" d="${d}"/>`);
     });
 
-  // E5 wind-history trail (independent on-demand layer): each past advisory's
-  // 34 kt field as a faint dashed outline -- the growth trail along the track.
-  const whistLayer = [];
-  if (lay.whist && lay.whist.advisories)
-    for (const advE of lay.whist.advisories)
-      for (const ring of advE.rings || [])
-        if (ring.length >= 3)
-          whistLayer.push(`<polygon class="hu-whist" points="${ptsStr(proj, ring.map(([lng, lat]) => [normLng(lng), lat]))}"/>`);
-
   const storm = [];
   if (triStripe === "left")
     for (const seg of st.ww || []) {
@@ -723,8 +713,12 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     const [x, y] = projPts[i];
     const ink = (p.cat === "TD" || p.cat === "TS" || p.cat === "HU") ? "#EDE3D2" : "#14110d";
     storm.push(`<circle class="hu-fdot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="12" fill="${catColor(p.cat)}"/>`);
+    // Current position (first point, tau 0): white ring so "now" reads at a glance.
+    if (i === 0)
+      storm.push(`<circle class="hu-now-ring" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="15"/>`);
     storm.push(`<text class="hu-fcat" x="${x.toFixed(1)}" y="${(y + 5).toFixed(1)}" fill="${ink}">${esc(catDotLabel(p.cat))}</text>`);
-    keepOut.push({ x1: x - 15, y1: y - 15, x2: x + 15, y2: y + 15 });
+    keepOut.push(i === 0 ? { x1: x - 18, y1: y - 18, x2: x + 18, y2: y + 18 }
+                         : { x1: x - 15, y1: y - 15, x2: x + 15, y2: y + 15 });
     if (p.label) {
       const a = projPts[i - 1] || [x, y], b = projPts[i + 1] || [x, y];
       labelJobs.push({ cx: x, cy: y, text: p.label, tdx: b[0] - a[0], tdy: b[1] - a[1] });
@@ -786,16 +780,13 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // the scale so they route around it. Loading/failure states are named
   // honestly -- never a silently missing layer.
   const mlegend = [];
-  const whistPending = lay.whist && (lay.whist.loading || lay.whist.failed);
-  if ((models && (modelRows.length || models.loading || models.failed)) || whistPending) {
+  if (models && (modelRows.length || models.loading || models.failed)) {
     const rows = modelRows.length ? modelRows.slice() : [];
-    if (models && !modelRows.length && (models.loading || models.failed))
+    if (!modelRows.length && (models.loading || models.failed))
       rows.push([models.loading ? "Loading model tracks…" : "Model tracks unavailable", null]);
-    if (whistPending)
-      rows.push([lay.whist.loading ? "Loading wind history…" : "Wind history unavailable", null]);
-    const rowH = 16, padX = 8, padY = 6;
+    const rowH = 19, padX = 8, padY = 6;
     const maxCh = Math.max(...rows.map((r) => r[0].length));
-    const w = padX + 24 + maxCh * 6.6 + padX;
+    const w = padX + 24 + maxCh * 8.4 + padX;
     const h = rows.length * rowH + padY * 2;
     const x0 = 12, y0 = VBH - 12 - h;
     mlegend.push(`<rect class="hu-mlegend-bg" x="${x0}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
@@ -823,9 +814,9 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
       });
     if (!rows.length)
       rows.push([lay.surge.loading ? "Loading storm surge…" : "Storm surge unavailable", null]);
-    const rowH = 16, padX = 8, padY = 6;
+    const rowH = 19, padX = 8, padY = 6;
     const maxCh = Math.max(...rows.map((r) => r[0].length));
-    const w = padX + 18 + maxCh * 6.6 + padX;
+    const w = padX + 18 + maxCh * 8.4 + padX;
     const h = rows.length * rowH + padY * 2;
     const x0 = VBW - 12 - w, y0 = VBH - 12 - h;
     slegend.push(`<rect class="hu-mlegend-bg" x="${x0.toFixed(0)}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
@@ -881,7 +872,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // maxScale ride as data-attrs so the gesture layer can read the pannable extent
   // + zoom ceiling off the DOM. Returns {svg, ctx}: the card stashes ctx for the
   // engine's re-runs.
-  const panGroup = [...base, ...windLayer, ...surgeLayer, ...whistLayer, ...gridDots,
+  const panGroup = [...base, ...windLayer, ...surgeLayer, ...gridDots,
     `<g class="hu-zl-cities">${zl0.cities}</g>`, ...storm,
     `<g class="hu-zl-regions">${zl0.regions}</g>`];
   const overlayGroup = [...scale, ...homeParts, ...mlegend, ...slegend];
@@ -1051,7 +1042,7 @@ const STYLE = `
               stroke-linejoin: round; stroke-linecap: round; }
   .hu-mlegend-bg { fill: #14110d; opacity: .55; }
   .hu-mlegend-sw { stroke-width: 2; stroke-dasharray: 5 4; }
-  .hu-mlegend-t { font: 600 11px/1 sans-serif; fill: #EDE3D2; }
+  .hu-mlegend-t { font: 600 14px/1 sans-serif; fill: #EDE3D2; }
   .hu-overlays.hu-hide { display: none; }
   .hu-tools { position: absolute; top: 10px; right: 10px; z-index: 2; display: flex; gap: 6px; align-items: center; }
   .hu-recenter { display: none; align-items: center; gap: 5px; border: none; cursor: pointer;
@@ -1121,11 +1112,11 @@ const STYLE = `
   .hu-land { fill: var(--hu-land-color, var(--divider-color)); opacity: var(--hu-land-opacity, .55); stroke: none; }
   .hu-state { fill: none; stroke: var(--hu-state-color, var(--secondary-text-color)); stroke-width: var(--hu-state-width, .6); opacity: .4; }
   .hu-coast { fill: none; stroke: var(--hu-coast-color, var(--primary-text-color)); stroke-width: var(--hu-coast-width, 1); opacity: var(--hu-coast-opacity, .7); stroke-linejoin: round; stroke-linecap: round; }
-  .hu-region { font: 600 12px/1 sans-serif; letter-spacing: .1em; text-transform: uppercase;
+  .hu-region { font: 600 14px/1 sans-serif; letter-spacing: .1em; text-transform: uppercase;
                text-anchor: middle; fill: var(--hu-region-color, var(--secondary-text-color)); opacity: .5;
                paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
   .hu-city { fill: var(--secondary-text-color); opacity: .75; }
-  .hu-city-label { font: 500 9.5px/1 sans-serif; fill: var(--secondary-text-color); opacity: .75;
+  .hu-city-label { font: 500 14px/1 sans-serif; fill: var(--secondary-text-color); opacity: .75;
                    paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 2.5px; }
   .hu-scale-tick { stroke: var(--secondary-text-color); stroke-width: 1.5; opacity: .55; }
   .hu-scale-label { font: 600 11px/1 sans-serif; fill: var(--secondary-text-color); opacity: .7;
@@ -1133,13 +1124,13 @@ const STYLE = `
   .hu-wind { fill-opacity: .42; stroke: none; }
   .hu-ww { fill: none; stroke-width: 4; stroke-linecap: round; }
   .hu-surge { fill-opacity: .5; stroke: none; }
-  .hu-whist { fill: none; stroke: var(--primary-text-color); stroke-opacity: .3; stroke-width: 1.2; stroke-dasharray: 3 3; }
   .hu-popdot { fill: #4FC3F7; stroke: rgba(0,0,0,.35); stroke-width: .5; }
   .hu-slegend-sw { stroke: rgba(0,0,0,.3); stroke-width: .5; }
   .hu-cone-poly { fill: var(--hu-cone-color, var(--primary-text-color)); fill-opacity: .08; stroke: var(--hu-cone-color, var(--primary-text-color)); stroke-opacity: .3; stroke-width: 1; }
   .hu-track-past { fill: none; stroke: var(--hu-track-past-color, var(--secondary-text-color)); stroke-width: 2; stroke-dasharray: 4 5; opacity: .6; }
   .hu-track-fcst { fill: none; stroke: var(--hu-track-color, var(--primary-text-color)); stroke-width: 2.5; opacity: .85; }
   .hu-fdot { stroke: rgba(0,0,0,.35); stroke-width: 1; }
+  .hu-now-ring { fill: none; stroke: #fff; stroke-width: 2.5; opacity: .95; }
   .hu-fcat { font: 700 13px/1 sans-serif; text-anchor: middle; }
   .hu-flabel { font: 700 17px/1 sans-serif; fill: var(--primary-text-color);
                paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
@@ -1385,14 +1376,11 @@ class HurricaneCard extends HTMLElement {
         const ms = this._layerState("models", st);
         modelState = ms.ok ? { list: ms.models } : ms;
       }
-      // E5 on-demand layers on the same cache/fetch path: storm surge draws
-      // when the coastal-stripe tri sits RIGHT; the wind-history trail is an
-      // independent toggle. Both NHC-only.
-      const lay = { surge: null, whist: null };
+      // E5 on-demand layer on the same cache/fetch path: storm surge draws
+      // when the coastal-stripe tri sits RIGHT. NHC-only.
+      const lay = { surge: null };
       if (nhcSt && triState(prefs, "stripe") === "right")
         lay.surge = this._layerState("surge", st);
-      if (nhcSt && prefs.wind_history)
-        lay.whist = this._layerState("wind_history", st);
       let svg = "", popImpact = null;
       this._labelCtx = null;   // E6: engine context, set only on a successful build
       try {
@@ -1501,7 +1489,7 @@ class HurricaneCard extends HTMLElement {
         this._layerPrefs = setLayerPref(this._layerPrefs || {}, id, el.checked);
         if (id === "advisory" && !el.checked) this._advOpen = false;
         // Re-toggling a fetching layer clears cached failures -> fresh retry.
-        if ((id === "models" || id === "wind_history") && el.checked)
+        if (id === "models" && el.checked)
           for (const k of Object.keys(this._layerCache))
             if (k.startsWith(id + "|") && this._layerCache[k].failed) delete this._layerCache[k];
         this._render();
@@ -1626,8 +1614,8 @@ class HurricaneCard extends HTMLElement {
     // than the frame, so slack floors at 0 -> the map stays centered. HARD limits:
     // no rubber-band, no overpan -- the clamp is applied every frame in apply().
     const slackAt = (s) => [
-      Math.max(0, (s - 1) * VBW / 2) + marginX * s,
-      Math.max(0, (s - 1) * VBH / 2) + marginY * s,
+      Math.max(0, (s - 1) * VBW / 2 + marginX * s),
+      Math.max(0, (s - 1) * VBH / 2 + marginY * s),
     ];
     const clampScale = (s) => Math.max(minScale, Math.min(maxScale, s));
     const clamp = () => {

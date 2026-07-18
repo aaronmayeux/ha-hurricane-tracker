@@ -25,8 +25,6 @@ from . import geometry, nhc
 from .const import (
     SURGE_OFFSET_DEG,
     SURGE_POINT_BUDGET,
-    WIND_HISTORY_OFFSET_DEG,
-    WIND_HISTORY_POINT_BUDGET,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,8 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 LAYER_ADVISORY = "advisory"
 LAYER_MODELS = "models"
 LAYER_SURGE = "surge"
-LAYER_WIND_HISTORY = "wind_history"
-LAYERS = {LAYER_ADVISORY, LAYER_MODELS, LAYER_SURGE, LAYER_WIND_HISTORY}
+LAYERS = {LAYER_ADVISORY, LAYER_MODELS, LAYER_SURGE}
 
 # Rising-severity order of the PeakStormSurge symbolid color classes -- used to
 # pick the WORST band containing home when bands overlap. Unknown symbols rank
@@ -142,41 +139,12 @@ def _surge_result(meta):
             "bands": bands, "atHome": at_home}
 
 
-def _wind_history_result(storm_id, meta):
-    """Per-advisory 34 kt growth trail (E5) for one NHC storm. NHC-only (GDACS's
-    whole-track swath already carries its wind history) -> None for GDACS.
-    Blocking (HTTP) -> executor-only. None = nothing usable."""
-    if meta.get("source") == "gdacs":
-        return None
-    hist = nhc.fetch_wind_history(meta.get("binNumber"), storm_id)
-    if not hist:
-        return None
-    remaining = WIND_HISTORY_POINT_BUDGET
-    advisories = []
-    for h in hist:
-        if remaining <= 0:
-            break
-        rings = geometry.simplify_rings(h["rings"], WIND_HISTORY_OFFSET_DEG,
-                                        budget=remaining)
-        if not rings:
-            continue
-        remaining -= sum(len(r) for r in rings)
-        advisories.append({"adv": h["adv"], "rings": rings})
-    if not advisories:
-        return None
-    return {"ok": True, "layer": LAYER_WIND_HISTORY,
-            "advisory": str(meta.get("advisory") or ""),
-            "advisories": advisories}
-
-
 def _build_result(layer, storm_id, meta):
     """Dispatch: build one layer's result. Blocking; executor-only."""
     if layer == LAYER_MODELS:
         return _models_result(storm_id, meta)
     if layer == LAYER_SURGE:
         return _surge_result(meta)
-    if layer == LAYER_WIND_HISTORY:
-        return _wind_history_result(storm_id, meta)
     return _advisory_result(meta)
 
 

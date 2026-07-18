@@ -48,9 +48,6 @@ from .const import (
     USER_AGENT,
     WIND_ADVISORY_OFFSET,
     WIND_FORECAST_OFFSET,
-    WIND_HISTORY_MAX_ADV,
-    WIND_HISTORY_OFFSET,
-    WIND_HISTORY_OFFSET_DEG,
     WIND_RADII_URL,
     WIND_SLOT_BLOCK,
     WIND_SLOT_STEP,
@@ -513,7 +510,11 @@ def fetch_wind_field(storm):
     if lid is None:
         return []
     sid = (storm.get("id") or "").upper()
-    where = "stormid='%s'" % sid if sid else "1=1"
+    # Layers 250/251 store stormid LOWERCASE ('ep052026') while the past-radii
+    # layer stores it UPPERCASE; the service '=' is case-sensitive, so match with
+    # UPPER() to work regardless of how NOAA cased this layer. (Bug: uppercase
+    # literal returned 0 features on live Elida -> empty wind field/swath.)
+    where = "UPPER(stormid)='%s'" % sid if sid else "1=1"
     url = ("%s/%d/query?where=%s&outFields=radii,ne,se,sw,nw"
            "&returnGeometry=false&f=json"
            % (WIND_RADII_URL, lid, urllib.parse.quote(where)))
@@ -582,7 +583,8 @@ def fetch_wind_forecast(storm):
     if lid is None:
         return []
     sid = (storm.get("id") or "").upper()
-    where = "stormid='%s'" % sid if sid else "1=1"
+    # Case-insensitive: this layer stores stormid lowercase (see fetch_wind_field).
+    where = "UPPER(stormid)='%s'" % sid if sid else "1=1"
     url = ("%s/%d/query?where=%s&outFields=radii,tau,ne,se,sw,nw"
            "&returnGeometry=false&f=json"
            % (WIND_RADII_URL, lid, urllib.parse.quote(where)))
@@ -593,18 +595,21 @@ def fetch_wind_forecast(storm):
 
 
 def build_wind_swath(fdata, storm):
-    """Assemble the wind swath from the current wind field + per-tau forecast radii,
-    each centered on its matching forecast point. Emits the SAME normalized schema
-    gdacs._wind_swath_from_bands does, so geometry draws an identical wind corridor
-    for both sources:
-      [{"kt": 34, "points": [{"lat":..,"lng":..,"ne":..,"se":..,"sw":..,"nw":..}, ...]}, ...]
-    Current position is the tau-0 point (from windField); tau>0 points come from
-    windForecast paired to the forecast `points` by rounded tau. [] when there's no
-    wind data (NHC-only; soft-fails with the rest of the wind pipeline).
+    """Assemble the wind swath as ordered per-threshold CENTER points, each carrying
+    that time's quadrant radii, so geometry sweeps ONE smooth corridor spanning
+    past + forecast (the GDACS whole-track look):
+      [{"kt": 34, "ordered": True, "points": [{"lat","lng","ne","se","sw","nw"}, ...]}, ...]
+    Order is strictly along travel: past advisories (oldest->newest, from the
+    best-track radii+centers in fdata['pastWind']), then the current position, then
+    the forecast taus. Points are PRE-ORDERED here (NHC times are reliable), so
+    geometry skips its nearest-neighbour reordering for these tiers -- the past is
+    swept by the SAME corridor builder as the forecast, not drawn as raw polygons.
+    [] when there's no wind data (NHC-only; soft-fails with the rest of the pipeline).
     """
     wf = fdata.get("windField") or []
     wfc = fdata.get("windForecast") or []
     pts = fdata.get("points") or []
+    past_wind = fdata.get("pastWind") or {}
     cur_lat = _num(storm.get("latitudeNumeric"))
     cur_lng = _num(storm.get("longitudeNumeric"))
     centers = {}
@@ -612,17 +617,18 @@ def build_wind_swath(fdata, storm):
         t = p.get("tau")
         if t is not None and p.get("lat") is not None and p.get("lng") is not None:
             centers[round(float(t))] = (p["lat"], p["lng"])
-    bykt = {34: [], 50: [], 64: []}
 
-    def _add(kt, lat, lng, r):
-        if kt in bykt:
-            bykt[kt].append({"lat": round(lat, 4), "lng": round(lng, 4),
-                             "ne": r.get("ne", 0), "se": r.get("se", 0),
-                             "sw": r.get("sw", 0), "nw": r.get("nw", 0)})
+    fwd = {34: [], 50: [], 64: []}   # forecast side (current tau0 + forecast taus)
+
+    def _pt(lat, lng, r, tau):
+        return {"lat": round(lat, 4), "lng": round(lng, 4),
+                "ne": r.get("ne", 0), "se": r.get("se", 0),
+                "sw": r.get("sw", 0), "nw": r.get("nw", 0), "_tau": tau}
 
     if cur_lat is not None and cur_lng is not None:
         for r in wf:
-            _add(r.get("kt"), cur_lat, cur_lng, r)
+            if r.get("kt") in fwd:
+                fwd[r["kt"]].append(_pt(cur_lat, cur_lng, r, 0.0))
     for entry in wfc:
         t = entry.get("tau")
         if t is None:
@@ -631,8 +637,74 @@ def build_wind_swath(fdata, storm):
         if not c:
             continue
         for r in entry.get("radii") or []:
-            _add(r.get("kt"), c[0], c[1], r)
-    return [{"kt": kt, "points": bykt[kt]} for kt in (34, 50, 64) if bykt[kt]]
+            if r.get("kt") in fwd:
+                fwd[r["kt"]].append(_pt(c[0], c[1], r, float(t)))
+
+    out = []
+    for kt in (34, 50, 64):
+        past = list(past_wind.get(kt) or [])          # already oldest->newest
+        fset = sorted(fwd[kt], key=lambda p: p["_tau"])
+        # Drop any past point that coincides with the current position so the
+        # past/forecast seam has no zero-length segment (~0.05 deg guard).
+        if past and fset:
+            c0 = fset[0]
+            past = [p for p in past
+                    if (p["lng"] - c0["lng"]) ** 2 + (p["lat"] - c0["lat"]) ** 2 > 2.5e-3]
+        seq = past + [{k: v for k, v in p.items() if k != "_tau"} for p in fset]
+        if seq:
+            out.append({"kt": kt, "ordered": True, "points": seq})
+    return out
+
+
+def parse_besttrack_wind_points(zb):
+    """From the best-track GIS zip: past wind-radii CENTER points per threshold, so
+    the past half of the wind swath is swept by the same smooth corridor builder as
+    the forecast (matching smoothing, no raw-polygon scallops). Centers come from
+    the _pts layer (LAT/LON keyed by synoptic time); the quadrant radii come from
+    the _radii layer (NE/SE/SW/NW per SYNOPTIME + threshold); the two are paired on
+    the 10-digit synoptic time (YYYYMMDDHH). Returns
+      {34: [{"lat","lng","ne","se","sw","nw"}, ...], 50: [...], 64: [...]}
+    time-ordered oldest->newest; soft-fails to {}.
+    """
+    z = zipfile.ZipFile(io.BytesIO(zb))
+    names = z.namelist()
+
+    def find(suffix):
+        return next((n for n in names if n.endswith(suffix)), None)
+
+    pd, rd = find("_pts.dbf"), find("_radii.dbf")
+    if not (pd and rd):
+        return {}
+    # centers: synoptic time (YYYYMMDDHH) -> (lat, lng)
+    _, prows = _read_dbf(z.read(pd))
+    centers = {}
+    for r in prows:
+        dtg = (r.get("DTG") or "").split(".")[0].strip()[:10]
+        lat, lng = _num(r.get("LAT")), _num(r.get("LON"))
+        if len(dtg) == 10 and lat is not None and lng is not None:
+            centers[dtg] = (lat, lng)
+    # radii: pair each (synoptic time, threshold) to its center; dedup by time
+    _, rrows = _read_dbf(z.read(rd))
+    bykt = {34: {}, 50: {}, 64: {}}
+    for r in rrows:
+        kt = _num(r.get("RADII"))
+        if kt is None:
+            continue
+        kt = int(round(kt))
+        if kt not in bykt:
+            continue
+        st = (r.get("SYNOPTIME") or "").split(".")[0].strip()[:10]
+        c = centers.get(st)
+        if not c:
+            continue
+        bykt[kt][st] = {"lat": round(c[0], 4), "lng": round(c[1], 4),
+                        "ne": _num(r.get("NE")) or 0, "se": _num(r.get("SE")) or 0,
+                        "sw": _num(r.get("SW")) or 0, "nw": _num(r.get("NW")) or 0}
+    out = {}
+    for kt, d in bykt.items():
+        if d:
+            out[kt] = [d[t] for t in sorted(d)]   # YYYYMMDDHH sorts chronologically
+    return out
 
 
 def fetch_storm_geometry(storm):
@@ -642,13 +714,23 @@ def fetch_storm_geometry(storm):
         return None
     fdata = parse_forecast(http_get(fz, binary=True))
     past = []
+    past_wind = {}
     bz = _besttrack_zip_url(storm)
     if bz:
+        zb = None
         try:
-            past = parse_besttrack(http_get(bz, binary=True))
+            zb = http_get(bz, binary=True)
+            past = parse_besttrack(zb)
         except Exception:  # best-track is optional; soft-fail
             past = []
+        if zb is not None:
+            try:
+                # Past wind-radii centers -> the past half of the wind swath.
+                past_wind = parse_besttrack_wind_points(zb)
+            except Exception:
+                past_wind = {}
     fdata["pastTrack"] = past
+    fdata["pastWind"] = past_wind
     # Current-position wind radii (NHC-only; soft-fails to []). UNVERIFIED live.
     try:
         fdata["windField"] = fetch_wind_field(storm)
@@ -660,8 +742,9 @@ def fetch_storm_geometry(storm):
         fdata["windForecast"] = fetch_wind_forecast(storm)
     except Exception:
         fdata["windForecast"] = []
-    # Wind swath (drawn corridor along the track), assembled from the two above +
-    # the forecast points. Same normalized schema GDACS emits. Soft-fails to [].
+    # Wind swath: ONE smooth corridor per threshold spanning past + forecast
+    # (build_wind_swath prepends the past centers from fdata["pastWind"]). Same
+    # normalized schema GDACS emits. Soft-fails to [].
     try:
         fdata["windSwath"] = build_wind_swath(fdata, storm)
     except Exception:
@@ -813,38 +896,6 @@ def fetch_peak_surge(lat, lng):
             sym = a.get("SYMBOLID")
         out.append({"name": str(name).strip(), "sym": sym, "rings": rings})
     return out
-
-
-def fetch_wind_history(bin_number, storm_id):
-    """Per-advisory 34 kt wind-radii polygons (the growth trail) for one NHC
-    storm, from the per-slot "Past Wind Radii" layer (WIND_HISTORY_OFFSET).
-    Reads the shipped GEOMETRY (outSR=4326) -- no center reconstruction.
-    Returns [{"adv", "t", "rings"}] ascending by synoptic time, capped to the
-    newest WIND_HISTORY_MAX_ADV advisories."""
-    lid = _wind_layer_id({"binNumber": bin_number}, WIND_HISTORY_OFFSET)
-    if lid is None:
-        return []
-    sid = (storm_id or "").upper().strip()
-    where = "stormid='%s' AND radii=34" % sid if sid else "radii=34"
-    params = urllib.parse.urlencode({
-        "where": where, "outFields": "advnum,synoptime,radii",
-        "returnGeometry": "true", "outSR": 4326,
-        "maxAllowableOffset": WIND_HISTORY_OFFSET_DEG, "f": "json",
-    })
-    url = "%s/%d/query?%s" % (WIND_RADII_URL, lid, params)
-    data = json.loads(http_get(url))
-    out = []
-    for ft in data.get("features") or []:
-        a = ft.get("attributes") or {}
-        rings = _esri_rings(ft)
-        if not rings:
-            continue
-        t = _num(a.get("synoptime"))
-        adv = a.get("advnum")
-        out.append({"adv": str(adv).strip() if adv is not None else "",
-                    "t": t, "rings": rings})
-    out.sort(key=lambda d: (d["t"] is None, d["t"]))
-    return out[-WIND_HISTORY_MAX_ADV:]
 
 
 # ---------------------------------------------------------------------------
