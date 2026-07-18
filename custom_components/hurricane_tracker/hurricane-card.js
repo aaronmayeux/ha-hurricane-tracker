@@ -42,7 +42,7 @@ const OPTIONAL_LAYERS = [
  * storms and fall back to their left/default state. */
 const TRI_GROUPS = [
   { key: "wind",   title: "Wind field",     lLabel: "Current",    rLabel: "Swath",      def: "left", master: "show_winds" },
-  { key: "stripe", title: "Coastal stripe", lLabel: "Watch/warn", rLabel: "Surge",      def: "left", nhcOnly: true },
+  { key: "stripe", title: "Coastal stripe", lLabel: "Warning",    rLabel: "Surge",      def: "left", nhcOnly: true },
 ];
 function triState(prefs, key) {
   const g = TRI_GROUPS.find((t) => t.key === key);
@@ -1089,7 +1089,7 @@ const STYLE = `
                 box-shadow: 0 1px 4px rgba(0,0,0,.3); opacity: .94; }
   .hu-toolbtn ha-icon { --mdc-icon-size: 16px; }
   .hu-panel { position: absolute; top: 44px; right: 10px; z-index: 3; display: none; width: 232px;
-              max-width: calc(100% - 20px); box-sizing: border-box;
+              max-width: calc(100% - 20px); box-sizing: border-box; container-type: inline-size;
               background: var(--card-background-color, var(--primary-background-color)); color: var(--primary-text-color);
               border-radius: 16px; padding: 12px 14px 10px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
   .hu-panel.hu-open { display: block; }
@@ -1104,29 +1104,29 @@ const STYLE = `
   .hu-seg { display: flex; width: 100%; height: 32px; box-sizing: border-box;
             border: 1px solid var(--divider-color, rgba(127,127,127,.45)); border-radius: 16px; overflow: hidden; }
   .hu-seg-btn { flex: 1 1 0; min-width: 0; border: none; background: transparent; cursor: pointer;
-                color: var(--primary-text-color); font: 500 12px/1 sans-serif; padding: 0 2px;
+                color: var(--primary-text-color); font: 500 clamp(8.5px, 6cqi, 12px)/1 sans-serif; padding: 0 3px;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
                 border-left: 1px solid var(--divider-color, rgba(127,127,127,.45)); }
   .hu-seg-btn:first-child { border-left: none; }
   .hu-seg-btn.hu-sel { background: rgba(3,169,244,.24);
                        background: color-mix(in srgb, var(--primary-color, #03a9f4) 26%, transparent);
-                       font-weight: 700; }
+                       font-weight: 600; }
   .hu-seg.hu-na { opacity: .38; pointer-events: none; }
   /* M3 list row + switch: label left, switch right, one vertical grid. */
   .hu-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
                   font: 400 13px/1.25 sans-serif; padding: 5px 0; cursor: pointer; }
   .hu-row-lbl { display: flex; flex-direction: column; min-width: 0; }
   .hu-row-lbl .hu-panel-note { margin-left: 0; }
-  input.hu-sw { appearance: none; -webkit-appearance: none; width: 44px; height: 26px; border-radius: 13px;
+  input.hu-sw { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; border-radius: 10px;
                 margin: 0; flex: none; position: relative; cursor: pointer;
                 background: var(--secondary-background-color); box-sizing: border-box;
                 border: 1.5px solid var(--divider-color, rgba(127,127,127,.55));
                 transition: background .15s, border-color .15s; }
   input.hu-sw::after { content: ""; position: absolute; top: 50%; left: 3px; transform: translateY(-50%);
-                       width: 16px; height: 16px; border-radius: 50%;
+                       width: 13px; height: 13px; border-radius: 50%;
                        background: var(--secondary-text-color); transition: left .15s, width .15s, height .15s, background .15s; }
   input.hu-sw:checked { background: var(--primary-color, #03a9f4); border-color: var(--primary-color, #03a9f4); }
-  input.hu-sw:checked::after { left: 21px; width: 20px; height: 20px; background: #fff; }
+  input.hu-sw:checked::after { left: 18px; width: 15px; height: 15px; background: #fff; }
   .hu-panel-perf { font: 400 10.5px/1.4 sans-serif; color: var(--secondary-text-color); opacity: .8;
                    margin-top: 10px; padding-top: 8px;
                    border-top: 1px solid var(--divider-color, rgba(127,127,127,.3)); }
