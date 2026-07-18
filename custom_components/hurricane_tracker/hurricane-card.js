@@ -137,10 +137,12 @@ const MODEL_COLOR = {
 };
 const modelColor = (id) => MODEL_COLOR[id] || "#9E9E9E";
 const LAYER_STORE_KEY = "hurricane-card:layers";
-function loadLayerPrefs() {
-  let p;
-  try { p = JSON.parse(localStorage.getItem(LAYER_STORE_KEY)) || {}; }
-  catch (_) { p = {}; }   // storage blocked (some webviews) -> session-only
+/* Normalize a raw prefs blob (from localStorage OR the HA per-user store) to the
+ * current schema. Idempotent, and copies before mutating so a live subscription
+ * message object is never altered in place. */
+function migratePrefs(p) {
+  p = (p && typeof p === "object") ? { ...p } : {};
+  if (p.tri) p.tri = { ...p.tri };
   // Migrate the pre-E5 wind_swath boolean into the wind tri-state.
   if (!p.tri) { p.tri = {}; if (p.wind_swath) p.tri.wind = "right"; }
   delete p.wind_swath;
@@ -154,6 +156,12 @@ function loadLayerPrefs() {
   }
   if (p.tri) delete p.tri.dots;
   return p;
+}
+function loadLayerPrefs() {
+  let p;
+  try { p = JSON.parse(localStorage.getItem(LAYER_STORE_KEY)) || {}; }
+  catch (_) { p = {}; }   // storage blocked (some webviews) -> session-only
+  return migratePrefs(p);
 }
 function saveLayerPrefs(p) {
   try { localStorage.setItem(LAYER_STORE_KEY, JSON.stringify(p)); } catch (_) {}
@@ -1237,10 +1245,54 @@ class HurricaneCard extends HTMLElement {
   disconnectedCallback() {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
     if (this._docClose) { document.removeEventListener("click", this._docClose, true); this._docClose = null; }
+    if (this._prefsUnsub) { this._prefsUnsub(); this._prefsUnsub = null; }
+    this._prefsSubStarted = false;
+  }
+
+  /* Cross-device layer-pref sync. The toggles live in Home Assistant's per-user
+   * data store (frontend/*_user_data), so the same login on a phone and a wall
+   * dashboard share one set of toggles, and the subscription pushes a change on
+   * one device to the others LIVE. localStorage stays as the instant first-paint
+   * source and an offline fallback; the server value wins once it arrives. */
+  _initPrefsSync() {
+    if (this._prefsSubStarted || !this._hass || !this._hass.connection) return;
+    this._prefsSubStarted = true;
+    try {
+      this._hass.connection.subscribeMessage(
+        (msg) => this._onServerPrefs(msg && msg.value),
+        { type: "frontend/subscribe_user_data", key: LAYER_STORE_KEY }
+      ).then((unsub) => { this._prefsUnsub = unsub; })
+       .catch(() => { this._prefsSubStarted = false; });   // WS unsupported -> local-only
+    } catch (_) { this._prefsSubStarted = false; }
+  }
+  _onServerPrefs(value) {
+    if (value && typeof value === "object" && Object.keys(value).length) {
+      const norm = migratePrefs(value);
+      this._serverPrefsSeen = true;
+      // Adopt only on a real change (the echo of our own set_user_data matches
+      // and is ignored, so there's no render loop).
+      if (JSON.stringify(norm) !== JSON.stringify(this._layerPrefs)) {
+        this._layerPrefs = norm;
+        saveLayerPrefs(norm);           // keep the offline fallback current
+        this._render();
+      }
+    } else if (!this._serverPrefsSeen) {
+      // No server value yet -> seed it once from the current (localStorage) prefs.
+      this._serverPrefsSeen = true;
+      this._pushPrefs();
+    }
+  }
+  _pushPrefs() {
+    if (!this._hass || !this._layerPrefs) return;
+    try {
+      this._hass.callWS({ type: "frontend/set_user_data",
+        key: LAYER_STORE_KEY, value: this._layerPrefs }).catch(() => {});
+    } catch (_) {}
   }
 
   _fetch() {
     if (!this._hass) return;
+    this._initPrefsSync();
     this._hass.callWS({ type: WS_TYPE }).then((res) => {
       const prevId = this._currentStormId();   // remember which storm the user is on
       this._data = res && res.data ? res.data : null;
@@ -1344,6 +1396,7 @@ class HurricaneCard extends HTMLElement {
   _applyTri(key, v) {
     if (!key || !(v === "left" || v === "off" || v === "right")) return;
     this._layerPrefs = setTriPref(this._layerPrefs || {}, key, v);
+    this._pushPrefs();   // sync to the user's other devices
     if (key === "stripe" && v === "right")
       for (const k of Object.keys(this._layerCache))
         if (k.startsWith("surge|") && this._layerCache[k].failed) delete this._layerCache[k];
@@ -1511,6 +1564,7 @@ class HurricaneCard extends HTMLElement {
       el.addEventListener("change", () => {
         const id = el.getAttribute("data-layer");
         this._layerPrefs = setLayerPref(this._layerPrefs || {}, id, el.checked);
+        this._pushPrefs();   // sync to the user's other devices
         if (id === "advisory" && !el.checked) this._advOpen = false;
         // Re-toggling a fetching layer clears cached failures -> fresh retry.
         if (id === "models" && el.checked)
@@ -1525,6 +1579,7 @@ class HurricaneCard extends HTMLElement {
         this._layerPrefs = this._layerPrefs || {};
         this._layerPrefs[key] = el.checked;
         saveLayerPrefs(this._layerPrefs);
+        this._pushPrefs();   // sync to the user's other devices
         this._render();
       }));
     // E5 tri-group segmented buttons (Material 3 pattern: one segment per
