@@ -58,8 +58,8 @@ class _Basemap:
         if buf[:4] != b"HURB":
             raise ValueError("bad basemap magic")
         ver, self.quant, nlayers = struct.unpack_from("<III", buf, 4)
-        if ver not in (2, 3):
-            raise ValueError("unsupported basemap version %d (need 2 or 3)" % ver)
+        if ver not in (2, 3, 4):
+            raise ValueError("unsupported basemap version %d (need 2, 3 or 4)" % ver)
         self.buf = buf
         p = 16
         dirs = []
@@ -69,20 +69,31 @@ class _Basemap:
             dirs.append((off, ln))
         # index[layer] = list of (minx, miny, maxx, maxy, points_offset, npts)
         self.index = {}
-        # places = list of (x, y, rank, pop, name) in quantized ints; decoded
-        # eagerly at load (a few thousand small records — one-time, cheap).
+        # Two POINT layers of (x, y, rank, pop, name) quantized ints, decoded
+        # eagerly at load (a few thousand small records each -- one-time, cheap):
+        #   places = GeoNames density set (rank = pop bucket), for popGrid.
+        #   named  = Natural Earth curated set (rank = scalerank), for the labels.
         self.places = []
-        if ver >= 3 and len(dirs) >= 4:
-            cur = dirs[3][0]
-            nplaces = struct.unpack_from("<I", buf, cur)[0]
+        self.named = []
+        rec = struct.calcsize("<iiBIB")   # 14: no alignment padding with "<"
+
+        def _points(dir_index):
+            out = []
+            cur = dirs[dir_index][0]
+            npl = struct.unpack_from("<I", buf, cur)[0]
             cur += 4
-            rec = struct.calcsize("<iiBIB")   # 14: no alignment padding with "<"
-            for _ in range(nplaces):
+            for _ in range(npl):
                 x, y, rank, pop, nlen = struct.unpack_from("<iiBIB", buf, cur)
                 cur += rec
                 name = buf[cur:cur + nlen].decode("utf-8", "replace")
                 cur += nlen
-                self.places.append((x, y, rank, pop, name))
+                out.append((x, y, rank, pop, name))
+            return out
+
+        if ver >= 3 and len(dirs) >= 4:
+            self.places = _points(3)
+        if ver >= 4 and len(dirs) >= 5:
+            self.named = _points(4)
         for name, (off, _ln) in zip(_LAYER_NAMES, dirs):
             parts = []
             cur = off
@@ -123,11 +134,8 @@ class _Basemap:
             out.append(self._decode(poff, npts))
         return out
 
-    def places_in(self, bbox, pad=0.0):
-        """Populated places inside the (padded) box, as dicts. Same quantized
-        bbox compare as clip() — no antimeridian wrap, matching the line layers.
-        Empty on a v2 basemap."""
-        if not self.places:
+    def _points_in(self, records, bbox, pad):
+        if not records:
             return []
         q = self.quant
         mnx = int((bbox[0] - pad) * q)
@@ -135,12 +143,24 @@ class _Basemap:
         mxx = int((bbox[2] + pad) * q)
         mxy = int((bbox[3] + pad) * q)
         out = []
-        for (x, y, rank, pop, name) in self.places:
+        for (x, y, rank, pop, name) in records:
             if x < mnx or x > mxx or y < mny or y > mxy:
                 continue
             out.append({"name": name, "lng": x / q, "lat": y / q,
                         "rank": rank, "pop": pop})
         return out
+
+    def places_in(self, bbox, pad=0.0):
+        """GeoNames density places inside the (padded) box, as dicts (rank = pop
+        bucket). Same quantized bbox compare as clip() — no antimeridian wrap,
+        matching the line layers. Empty on a v2 basemap."""
+        return self._points_in(self.places, bbox, pad)
+
+    def named_in(self, bbox, pad=0.0):
+        """Curated Natural Earth named places inside the (padded) box, as dicts
+        with rank = scalerank (0 = most prominent). Empty on a v2/v3 basemap (no
+        named layer) — the caller then falls back to the GeoNames places."""
+        return self._points_in(self.named, bbox, pad)
 
 
 def _thin_pop_grid(places, view_box):
@@ -738,13 +758,21 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
 
     # City dots (E3): places inside the BUFFERED viewBox (they live in the
     # geographic hu-pan group, so panning reveals them like the coastline),
-    # biggest population first, capped so a metro-dense frame stays light. The
+    # prominence-ranked (see below), capped so a dense frame stays light. The
     # card handles label declutter; a v2 basemap yields [] and nothing draws.
-    all_places = basemap.places_in(view_box)
-    places = sorted(all_places, key=lambda p: -p["pop"])[:CITY_DOT_CAP]
+    all_places = basemap.places_in(view_box)   # GeoNames -> density (popGrid)
+    # NAMED city dots: the curated Natural Earth set, ranked by prominence
+    # (scalerank asc, then metro pop) so the labels are the cities people expect
+    # on a map -- not GeoNames' raw-population picks, which surface metro boroughs
+    # and sub-city municipalities (Iztapalapa over Mexico City, Zapopan over
+    # Guadalajara). Falls back to GeoNames top-by-pop on a v3 basemap with no
+    # named layer, so an un-regenerated install still draws city dots.
+    named = basemap.named_in(view_box)
+    src = (sorted(named, key=lambda p: (p["rank"], -p["pop"]))
+           if named else sorted(all_places, key=lambda p: -p["pop"]))
     places = [{"name": p["name"], "lng": round(p["lng"], 4),
                "lat": round(p["lat"], 4), "pop": p["pop"], "rank": p["rank"]}
-              for p in places]
+              for p in src[:CITY_DOT_CAP]]
     # E5 population-density grid: in-view places as compact [lng,lat,pop]
     # triples (no names -- the density picture doesn't label). The card's
     # Population dot mode draws all of them and sums the population inside the

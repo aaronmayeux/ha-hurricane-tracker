@@ -239,6 +239,11 @@ def _layer_meta(storms, home_lat=None, home_lon=None):
                 "source": "nhc", "name": storm.get("name") or "",
                 "advisory": str(pub.get("advNum") or ""),
                 "products": products,
+                # E4 model tracks clip to the current-position ring: lat/lng is
+                # that ring, dir is the heading for the half-plane clip (only
+                # when moving, else the clip falls back to nearest-point).
+                "dir": (storm.get("movementDir")
+                        if storm.get("movementSpeed") else None),
                 # E5 (surge + wind history): the slot bin drives the per-slot
                 # layer id; lat/lng anchors the surge spatial envelope; home
                 # feeds the surge at-home test. All already in hand this poll.

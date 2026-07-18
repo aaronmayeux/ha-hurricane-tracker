@@ -420,19 +420,27 @@ function pointInPoly(x, y, poly) {
  * counter-scale: translate(ax,ay) scale(1/s). The gesture layer updates that
  * counter-scale every frame (cheap) and re-runs this layout pass ~150 ms after
  * the view settles (collision, tier gating, reveal-on-pan). Screen position of
- * any default-frame px point under the view (s,tx,ty) is simply s*p+t, so the
- * keep-out boxes of the geographic storm furniture (forecast dots + their time
- * labels) and the cone polygon transform affinely. Screen-space overlay boxes
- * (home marker, model legend) apply only at the default frame -- the overlays
- * are hidden everywhere else. */
+ * any default-frame px point under the view (s,tx,ty) is simply s*p+t: the cone
+ * polygon transforms affinely, but the forecast dots + their time labels now
+ * hold constant on-screen size (their own .hu-zl groups, like these labels), so
+ * their keep-out boxes translate with the view at a FIXED size, not scaled.
+ * Screen-space overlay boxes (home marker, model legend) apply only at the
+ * default frame -- the overlays are hidden everywhere else. */
 const REGION_CHAR_W = 8.6;   // ~14px uppercase sans-serif (matches .hu-region)
 /* Nudge offsets tried in order (px). Anchor first, then toward open water nearby. */
 const REGION_NUDGES = [[0, 0], [0, 15], [0, -15], [16, 0], [-16, 0], [0, 28], [0, -28], [22, 14], [-22, 14], [22, -14], [-22, -14], [0, 42], [0, -42]];
 function layoutZoomLabels(ctx, view) {
   const s = view.s || 1, tx = view.tx || 0, ty = view.ty || 0;
   const T = (x, y) => [s * x + tx, s * y + ty];
-  const keep = ctx.keepGeo.map((b) =>
-    ({ x1: s * b.x1 + tx, y1: s * b.y1 + ty, x2: s * b.x2 + tx, y2: s * b.y2 + ty }));
+  // keepGeo boxes are the forecast dots + time labels -- now CONSTANT on-screen
+  // size (they're counter-scaled .hu-zl groups). Translate each box's CENTER with
+  // the view but keep its size fixed; scaling the box (the old affine map) would
+  // over/under-state the clearance and let region/city labels collide on zoom.
+  const keep = ctx.keepGeo.map((b) => {
+    const hw = (b.x2 - b.x1) / 2, hh = (b.y2 - b.y1) / 2;
+    const cx = s * ((b.x1 + b.x2) / 2) + tx, cy = s * ((b.y1 + b.y2) / 2) + ty;
+    return { x1: cx - hw, y1: cy - hh, x2: cx + hw, y2: cy + hh };
+  });
   const atDefault = s <= 1.001 && s >= 0.999 && Math.abs(tx) < 0.5 && Math.abs(ty) < 0.5;
   if (atDefault) keep.push(...ctx.keepScreen);
   const conePx = ctx.conePx.map(([x, y]) => T(x, y));
@@ -704,19 +712,28 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     }
   }
 
-  const keepOut = [];      // GEOGRAPHIC keep-out boxes (forecast dots + time labels): transform affinely with the view
+  const keepOut = [];      // GEOGRAPHIC keep-out boxes (forecast dots + time labels): CONSTANT on-screen size, so layoutZoomLabels translates their CENTER with the view but does NOT scale the box
   const keepScreen = [];   // screen-space overlay boxes (home marker, model legend): only valid at the default frame
   const labelJobs = [];
   const projPts = (st.points || []).map((p) => (p.lng == null || p.lat == null) ? null : proj(p.lng, p.lat));
+  // Forecast dots + time labels are GEOGRAPHIC anchors but hold CONSTANT on-screen
+  // size (like region/city labels) via .hu-zl counter-scale groups, so they don't
+  // balloon on zoom-in -- the gesture loop counter-scales every .hu-zl each frame.
+  // Dots and labels go in SEPARATE groups (all dots pushed first, then all labels)
+  // so labels stay painted on top of every dot, exactly as before.
+  const fdotGroups = [], flabelGroups = [];
+  const zlFixed = (ax, ay, inner) =>
+    `<g class="hu-zl" data-ax="${ax.toFixed(1)}" data-ay="${ay.toFixed(1)}" transform="translate(${ax.toFixed(1)} ${ay.toFixed(1)}) scale(1)">${inner}</g>`;
   (st.points || []).forEach((p, i) => {
     if (p.lng == null || p.lat == null) return;
     const [x, y] = projPts[i];
     const ink = (p.cat === "TD" || p.cat === "TS" || p.cat === "HU") ? "#EDE3D2" : "#14110d";
-    storm.push(`<circle class="hu-fdot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="12" fill="${catColor(p.cat)}"/>`);
-    // Current position (first point, tau 0): white ring so "now" reads at a glance.
-    if (i === 0)
-      storm.push(`<circle class="hu-now-ring" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="15"/>`);
-    storm.push(`<text class="hu-fcat" x="${x.toFixed(1)}" y="${(y + 5).toFixed(1)}" fill="${ink}">${esc(catDotLabel(p.cat))}</text>`);
+    // Inner elements anchor at the group origin (0,0); the group's translate puts
+    // them at the dot. Same paint order as before: dot, then "now" ring, then glyph.
+    let inner = `<circle class="hu-fdot" cx="0" cy="0" r="12" fill="${catColor(p.cat)}"/>`;
+    if (i === 0) inner += `<circle class="hu-now-ring" cx="0" cy="0" r="15"/>`;   // current position (tau 0)
+    inner += `<text class="hu-fcat" x="0" y="5" fill="${ink}">${esc(catDotLabel(p.cat))}</text>`;
+    fdotGroups.push(zlFixed(x, y, inner));
     keepOut.push(i === 0 ? { x1: x - 18, y1: y - 18, x2: x + 18, y2: y + 18 }
                          : { x1: x - 15, y1: y - 15, x2: x + 15, y2: y + 15 });
     if (p.label) {
@@ -725,11 +742,15 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     }
   });
   placeLabels(labelJobs).forEach((L) => {
-    const rot = L.deg ? ` transform="rotate(${L.deg.toFixed(1)},${L.cx.toFixed(1)},${L.cy.toFixed(1)})"` : "";
-    storm.push(`<text class="hu-flabel" x="${(L.cx + 16).toFixed(1)}" y="${(L.cy + 5).toFixed(1)}" text-anchor="${L.anchor}"${rot}>${esc(L.text)}</text>`);
+    // Label anchors at its dot origin (0,0); rotation about the origin is
+    // translation-invariant, so placeLabels' spoke `deg` still applies verbatim.
+    const rot = L.deg ? ` transform="rotate(${L.deg.toFixed(1)},0,0)"` : "";
+    const inner = `<text class="hu-flabel" x="16" y="5" text-anchor="${L.anchor}"${rot}>${esc(L.text)}</text>`;
+    flabelGroups.push(zlFixed(L.cx, L.cy, inner));
     const w = (L.text ? L.text.length : 0) * CHAR_W;
     keepOut.push(labelBox(L.cx, L.cy, w, L.deg));
   });
+  storm.push(...fdotGroups, ...flabelGroups);
 
   const homeParts = [];
   let farCase = false, hcx = 0, hcy = 0;
@@ -860,8 +881,11 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   const zl0 = layoutZoomLabels(ctx, { s: 1, tx: 0, ty: 0 });
 
   // Two sibling groups. hu-pan holds the GEOGRAPHIC layers (basemap, wind wash,
-  // cone/track/dots/ww + on-dot labels) -- these scale honestly, so pan/zoom is a
-  // transform on this group alone. The E6 label groups live in hu-pan too: cities
+  // cone/track/ww) -- these scale honestly, so pan/zoom is a transform on this
+  // group alone. The forecast dots + on-dot time labels ride hu-pan too but hold
+  // constant on-screen size via their own counter-scaled .hu-zl groups (like the
+  // city/region labels), so they don't balloon on zoom-in. The E6 label groups
+  // live in hu-pan too: cities
   // UNDER the storm data, region names ABOVE it (same stacking as before), each a
   // counter-scaled .hu-zl group the gesture layer maintains per frame. hu-overlays
   // keeps the true screen-space furniture (off-screen home marker, offshore mileage

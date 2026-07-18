@@ -91,7 +91,8 @@ def _models_result(storm_id, meta):
     Blocking (HTTP) -> always called in an executor. None = nothing usable."""
     if meta.get("source") == "gdacs":
         return None
-    models = nhc.fetch_model_tracks(storm_id)
+    models = nhc.fetch_model_tracks(
+        storm_id, (meta.get("lng"), meta.get("lat")), meta.get("dir"))
     if not models:
         return None
     return {"ok": True, "layer": LAYER_MODELS,

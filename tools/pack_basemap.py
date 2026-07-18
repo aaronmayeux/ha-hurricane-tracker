@@ -11,20 +11,24 @@ Sources:
     coast  : ne_10m_coastline.geojson                      (finest NE tier)
     land   : ne_10m_land.geojson
     states : ne_10m_admin_1_states_provinces_lines.geojson (10m: full global coverage incl. Mexico; 50m was sparse)
-  Places — GeoNames cities5000 (download.geonames.org/export/dump), licensed
-  CC-BY 4.0 — attribution "GeoNames (geonames.org)" REQUIRED wherever the data
-  ships (README carries it). ~50k populated places with pop >= 5000, versus the
-  ~5.2k >= 25k the old Natural Earth populated_places source gave — this is what
-  makes the Population-dots density picture dense and the in-cone population
-  figure less undercounted.
+  Density places — GeoNames cities5000 (download.geonames.org/export/dump),
+  licensed CC-BY 4.0 — attribution "GeoNames (geonames.org)" REQUIRED wherever
+  the data ships (README carries it). ~50k populated places with pop >= 5000 —
+  this is what makes the Population-dots density picture dense and the in-cone
+  population figure less undercounted. Ranked by raw population, so it is NOT
+  used for the named-city labels (that surfaces metro boroughs over the primary
+  city); it feeds the density dots only.
+  Named places — Natural Earth ne_10m_populated_places (public domain), the
+  curated "cities on a map" set (~7.3k) with a SCALERANK prominence rank and
+  metro POP_MAX. Feeds the named-city labels (Cities mode) so they read as the
+  cities people expect.
 
-GeoNames rows are filtered: feature codes PPLX (a SECTION of a city — keeping
-these double-counts every metro: Brooklyn AND New York City both ship in
-cities5000), plus PPLH/PPLQ/PPLW/PPLCH (historical/abandoned/destroyed) are
-excluded; rows with population < --min-pop are dropped. The v3 record's rank
-byte (Natural Earth scalerank, gone in GeoNames) is synthesized from population
-buckets so the binary format is unchanged — nothing downstream sorts by rank
-today, but the byte is part of the record.
+GeoNames rows (the density layer) are filtered: feature codes PPLX (a SECTION of
+a city — keeping these double-counts every metro: Brooklyn AND New York City both
+ship in cities5000), plus PPLH/PPLQ/PPLW/PPLCH (historical/abandoned/destroyed)
+are excluded; rows with population < --min-pop are dropped. Their rank byte is a
+population bucket. The named layer (Natural Earth) instead carries NE's curated
+scalerank in its rank byte — which is what geometry.py sorts the city labels by.
 
 Global. A light Douglas-Peucker pass (--tol degrees) drops redundant collinear
 points to bound on-disk size; the integration re-simplifies per view at draw
@@ -35,8 +39,8 @@ verbatim out of an already-built HURB v2/v3 file and rebuild ONLY the places
 layer. Skips the ~30 MB Natural Earth downloads and the (slow) DP pass, and
 keeps the line layers byte-identical across a places-only regen.
 
-BINARY FORMAT (HURB v3, little-endian) — see geometry.py for the matching reader:
-  b"HURB" | u32 version(=3) | u32 quant(=10000) | u32 nlayers(=4)
+BINARY FORMAT (HURB v4, little-endian) — see geometry.py for the matching reader:
+  b"HURB" | u32 version(=4) | u32 quant(=10000) | u32 nlayers(=5)
   nlayers x (u32 offset, u32 len)                  # layer directory
   line/ring layer @offset (coast, states, land — unchanged from v2):
     u32 nparts
@@ -44,14 +48,17 @@ BINARY FORMAT (HURB v3, little-endian) — see geometry.py for the matching read
       i32 minx, i32 miny, i32 maxx, i32 maxy       # quantized bbox (spatial index)
       u32 npts
       npts x (i32 x, i32 y)                         # round(lng*quant), round(lat*quant)
-  places layer @offset (POINT layer, new in v3):
+  places layer @offset (POINT layer, GeoNames density set, new in v3):
     u32 nplaces
     per place:
       i32 x, i32 y                                  # quantized lng, lat
-      u8 rank                                       # pop bucket (0 = biggest)
+      u8 rank                                       # GeoNames pop bucket (0 = biggest)
       u32 pop                                       # population
       u8 namelen | namelen bytes utf-8              # city name (ascii form)
-  Layer order: coast, states, land, places.
+  named layer @offset (POINT layer, Natural Earth curated set, new in v4):
+    SAME record layout as places, but the rank byte carries NE scalerank
+    (0 = most prominent) instead of a pop bucket. Drives the named-city labels.
+  Layer order: coast, states, land, places, named.
 The per-part bbox lets the reader skip parts outside the storm view without
 decoding their points — so a global map costs almost no memory to clip.
 
@@ -66,8 +73,8 @@ import argparse, io, json, math, os, struct, urllib.request, zipfile
 
 QUANT = 10000
 MAGIC = b"HURB"
-VERSION = 3
-LAYER_ORDER = ["coast", "states", "land", "places"]
+VERSION = 4
+LAYER_ORDER = ["coast", "states", "land", "places", "named"]
 LINE_LAYERS = ["coast", "states", "land"]
 NE_SOURCES = {
     "coast":  ("ne_10m_coastline.geojson", "line"),
@@ -82,9 +89,17 @@ NE_BASE_URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/ma
 STATES_EXTRA = "ne_10m_admin_0_boundary_lines_land.geojson"
 
 # GeoNames cities5000: every place with population > 5000 (plus admin seats).
-# CC-BY 4.0 — keep the attribution wherever this data ships.
+# CC-BY 4.0 — keep the attribution wherever this data ships. Drives the DENSITY
+# dots only (Population mode) -- its raw-population ranking surfaces metro
+# boroughs/municipalities (Iztapalapa, Ecatepec, Zapopan) over the recognizable
+# primary city, so it is NOT used for the named-city labels.
 GEONAMES_URL = "https://download.geonames.org/export/dump/cities5000.zip"
 GEONAMES_TXT = "cities5000.txt"
+# Natural Earth populated places (public domain): the CURATED "cities on a map"
+# set (~7.3k), each with a SCALERANK prominence rank (0 = most prominent) and a
+# metro POP_MAX. Drives the NAMED-city dots (Cities mode) so the labels are the
+# cities people expect -- capitals and principal cities, no boroughs.
+NE_POP_PLACES = "ne_10m_populated_places.geojson"
 # Feature codes excluded from the pack. PPLX = a section of a populated place
 # (borough/district) — its population is already inside its parent city, so
 # keeping it double-counts metros in the card's in-cone population sum.
@@ -211,9 +226,38 @@ def build_places_layer(places):
     for lng, lat, rank, pop, name in places:
         nb = name.encode("utf-8")[:255]
         body += struct.pack("<iiBIB", round(lng * QUANT), round(lat * QUANT),
-                            rank, min(pop, 0xFFFFFFFF), len(nb))
+                            min(max(rank, 0), 255),
+                            max(0, min(int(pop), 0xFFFFFFFF)), len(nb))
         body += nb
     return bytes(body)
+
+
+def places_from_ne(path):
+    """(lng, lat, scalerank, pop_max, name) per Natural Earth populated place.
+    SCALERANK (0 = most prominent, curated) drives the NAMED-city selection;
+    POP_MAX is metro population. Same record shape as build_places_layer, so the
+    rank byte carries scalerank here (vs the GeoNames pop bucket). NE geojson
+    property keys are UPPER-case."""
+    gj = json.load(open(path))
+    out = []
+    for feat in gj.get("features", []):
+        g = feat.get("geometry") or {}
+        if g.get("type") != "Point":
+            continue
+        c = g.get("coordinates") or []
+        if len(c) < 2:
+            continue
+        pr = feat.get("properties") or {}
+        sr = pr.get("SCALERANK")
+        sr = 20 if sr is None else int(sr)
+        if sr < 0:
+            sr = 20
+        pop = int(pr.get("POP_MAX") or 0)
+        name = pr.get("NAMEASCII") or pr.get("NAME") or ""
+        if not name:
+            continue
+        out.append((float(c[0]), float(c[1]), sr, pop, name))
+    return out
 
 
 def line_layers_from_bin(path):
@@ -287,6 +331,12 @@ def main():
     bodies["places"] = build_places_layer(places)
     print(f"  places: {len(places):>6} (GeoNames cities5000, pop >= {args.min_pop}, "
           f"{len(bodies['places'])/1e6:.2f} MB)")
+
+    ne_pop_path = ensure(NE_POP_PLACES, NE_BASE_URL + NE_POP_PLACES)
+    named = places_from_ne(ne_pop_path)
+    bodies["named"] = build_places_layer(named)
+    print(f"  named:  {len(named):>6} (Natural Earth populated places, scalerank-ranked, "
+          f"{len(bodies['named'])/1e6:.2f} MB)")
 
     out = bytearray(MAGIC + struct.pack("<III", VERSION, QUANT, len(LAYER_ORDER)))
     dirpos = len(out)

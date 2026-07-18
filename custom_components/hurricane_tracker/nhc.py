@@ -772,13 +772,75 @@ def _atcf_ll(tok):
     return -v if tok[-1] in "WwSs" else v
 
 
-def parse_model_tracks(text):
+def _dtg_dt(dtg):
+    """ATCF DTG 'YYYYMMDDHH' -> datetime (UTC-naive), or None on junk."""
+    from datetime import datetime
+    try:
+        return datetime.strptime((dtg or "").strip(), "%Y%m%d%H")
+    except (ValueError, TypeError):
+        return None
+
+
+def _clip_behind(pts, cur, motion_dir):
+    """Drop the leading points that fall behind the current storm position and
+    anchor the line there, so each guidance line starts at the current-position
+    ring instead of trailing into the past. 'Behind' = the far side of the plane
+    through cur perpendicular to the storm's motion (heading half-plane); with no
+    usable heading, keep from the point nearest cur. cur is (lng, lat). This is a
+    PHYSICAL clip, not a time one: raw models analyze the storm a touch behind
+    NHC's official current position even on the matching cycle, so a timestamp
+    trim can't catch those points -- geometry can."""
+    if not cur or cur[0] is None or cur[1] is None or len(pts) < 2:
+        return pts
+    clng, clat = float(cur[0]), float(cur[1])
+    cosf = math.cos(math.radians(clat)) or 1.0
+    mv = None
+    try:
+        if motion_dir is not None:
+            r = math.radians(float(motion_dir))
+            mv = (math.sin(r), math.cos(r))   # (east, north) unit heading
+    except (TypeError, ValueError):
+        mv = None
+    if mv:
+        i = 0
+        while i < len(pts):
+            ex = (pts[i][0] - clng) * cosf
+            ny = pts[i][1] - clat
+            if ex * mv[0] + ny * mv[1] >= 0:   # at/ahead of the ring -> stop
+                break
+            i += 1
+        kept = pts[i:]
+    else:
+        best, bi = None, 0
+        for i, p in enumerate(pts):
+            ex = (p[0] - clng) * cosf
+            ny = p[1] - clat
+            d = ex * ex + ny * ny
+            if best is None or d < best:
+                best, bi = d, i
+        kept = pts[bi:]
+    if not kept:
+        return []
+    anchor = [round(clng, 2), round(clat, 2)]
+    if kept[0] != anchor:
+        kept = [anchor] + kept
+    return kept
+
+
+def parse_model_tracks(text, cur=None, motion_dir=None):
     """a-deck text -> [{"id": tech, "label": .., "points": [[lng, lat], ..]}, ..]
     in MODEL_TRACK_TECHS order. Per tech, the tech's OWN latest cycle is used
     (raw models lag OFCL by a cycle), but only if it's within
     MODEL_TRACK_STALE_H of the deck's newest cycle -- a model that stopped
     running must not draw a days-old track. TVCN is the preferred consensus;
-    HCCA fills in only when TVCN is absent. Empty list on an empty/junk deck."""
+    HCCA fills in only when TVCN is absent.
+
+    `cur` (lng, lat) is the current storm position and `motion_dir` its compass
+    heading. When given, each tech's line is clipped to the current-position ring
+    (see _clip_behind): leading points behind the ring are dropped and the line
+    is anchored at cur, so guidance radiates from the current dot instead of
+    trailing into the past. cur=None -> no clip. Empty list on an empty/junk
+    deck."""
     wanted = {t for t, _ in MODEL_TRACK_TECHS}
     # rows[tech][dtg][tau] = (lng, lat), first row per tau wins
     rows = {}
@@ -800,17 +862,14 @@ def parse_model_tracks(text):
     if not rows:
         return []
     newest = max(dtg for percyc in rows.values() for dtg in percyc)
+    newest_dt = _dtg_dt(newest)
 
     def _fresh(dtg):
         # DTGs are fixed-width YYYYMMDDHH; hour distance via int subtraction is
         # only safe same-day, so compare as timestamps.
-        from datetime import datetime
-        try:
-            a = datetime.strptime(newest, "%Y%m%d%H")
-            b = datetime.strptime(dtg, "%Y%m%d%H")
-        except ValueError:
-            return False
-        return (a - b).total_seconds() <= MODEL_TRACK_STALE_H * 3600
+        d = _dtg_dt(dtg)
+        return bool(newest_dt and d and
+                    (newest_dt - d).total_seconds() <= MODEL_TRACK_STALE_H * 3600)
 
     out = []
     have_tvcn = "TVCN" in rows
@@ -824,21 +883,30 @@ def parse_model_tracks(text):
         if not _fresh(dtg):
             continue
         taus = sorted(percyc[dtg])
-        pts = [list(percyc[dtg][t]) for t in taus][:MODEL_TRACK_MAX_PTS]
+        # Clip the stale "back half": drop leading points that fall behind the
+        # current-position ring and anchor the line at it, so guidance radiates
+        # from the current dot instead of trailing into the past (raw models
+        # analyze the storm slightly behind NHC's official position, so their
+        # early points sit where the storm already was).
+        pts = _clip_behind([list(percyc[dtg][t]) for t in taus],
+                           cur, motion_dir)[:MODEL_TRACK_MAX_PTS]
         if len(pts) >= 2:
             out.append({"id": tech, "label": label, "points": pts})
     return out
 
 
-def fetch_model_tracks(storm_id):
+def fetch_model_tracks(storm_id, cur=None, motion_dir=None):
     """Fetch + parse the a-deck guidance tracks for one NHC storm. Blocking;
-    raises on network/parse failure (the layer platform soft-fails it)."""
+    raises on network/parse failure (the layer platform soft-fails it).
+    `cur` (lng, lat) + `motion_dir` (compass heading) clip each model's stale
+    back half at the current-position ring (see parse_model_tracks)."""
     import gzip
     sid = (storm_id or "").lower().strip()
     if not sid:
         return []
     raw = http_get(ADECK_URL % sid, binary=True)
-    return parse_model_tracks(gzip.decompress(raw).decode("utf-8", "replace"))
+    return parse_model_tracks(
+        gzip.decompress(raw).decode("utf-8", "replace"), cur, motion_dir)
 
 
 # ---------------------------------------------------------------------------
