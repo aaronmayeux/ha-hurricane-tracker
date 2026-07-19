@@ -623,12 +623,19 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   const windLayer = [];
   // Wind source follows the wind tri-state: LEFT (default) = the singular
   // current-position 34/50/64 field, RIGHT = the full-track swath (GDACS's
-  // whole-track envelope / NHC's forecast corridor), CENTER = off. Each side
-  // falls back to whichever exists so a storm with only one still draws.
-  let windSrc = null;
-  if (triWind === "left")
-    windSrc = (st.windField && st.windField.length) ? st.windField : st.windSwath;
-  else if (triWind === "right")
+  // whole-track envelope / NHC's forecast corridor), CENTER = off.
+  // LEFT does NOT fall back to the swath: a TD carries no current >=34 kt
+  // radii, and silently drawing the multi-day forecast swath under "Current"
+  // read as the storm being enormous right now (Aaron, 2026-07-18, live on
+  // Six-E). An empty field draws nothing and drops an honest note into the
+  // corner legend slot instead (stacks with the stripe/surge notes). RIGHT
+  // still falls back to the current field — a bigger promise degrading to a
+  // smaller truth isn't misleading.
+  let windSrc = null, windNote = false;
+  if (triWind === "left") {
+    windSrc = (st.windField && st.windField.length) ? st.windField : null;
+    windNote = !windSrc;
+  } else if (triWind === "right")
     windSrc = (st.windSwath && st.windSwath.length) ? st.windSwath : st.windField;
   if (windSrc && windSrc.length)
     for (const w of windSrc) {
@@ -885,6 +892,12 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
         && !(st.ww || []).some((seg) => wwColor(seg.type) && seg.coords && seg.coords.length >= 2)) {
       rows.push(["No coastal warnings in effect", null]);
     }
+    // Wind note STACKS below the stripe/surge rows in the same box — the
+    // corner slot is one stacked legend; notes never fight for it. Neutral
+    // wording on purpose: an empty field is usually a TD (winds under 34 kt)
+    // but can also be a fetch soft-fail, and the card can't tell them apart.
+    if (windNote)
+      rows.push(["No current wind field", null]);
     if (rows.length) {
       // Swatchless notes ("Storm surge unavailable", "No coastal warnings in
       // effect") are right-justified: no 18px swatch slot in the box, text
@@ -1843,15 +1856,26 @@ class HurricaneCard extends HTMLElement {
     // measurement (e.g. hidden tab) leaves the estimated box alone.
     {
       const fit = () => {
-        const nt = this.shadowRoot && this.shadowRoot.querySelector("text.hu-note-t");
+        const nts = this.shadowRoot ? this.shadowRoot.querySelectorAll("text.hu-note-t") : [];
         const nb = this.shadowRoot && this.shadowRoot.querySelector("rect.hu-note-bg");
-        if (!nt || !nb) return;
+        if (!nts.length || !nb) return;
         try {
-          const bx = nt.getBBox();
-          if (!bx || !(bx.width > 0)) return;
+          // Notes can STACK (e.g. "No coastal warnings in effect" over "No
+          // current wind field"): fit the shared rect to the UNION of every
+          // note's measured bbox — right edges align (text-anchor end), the
+          // widest note sets the left edge.
+          let left = Infinity, right = -Infinity;
+          nts.forEach((nt) => {
+            const bx = nt.getBBox();
+            if (bx && bx.width > 0) {
+              left = Math.min(left, bx.x);
+              right = Math.max(right, bx.x + bx.width);
+            }
+          });
+          if (!(right > left)) return;   // zero-width measures (hidden tab) leave the estimate
           const padX = 8;
-          nb.setAttribute("x", (bx.x - padX).toFixed(1));
-          nb.setAttribute("width", (bx.width + padX * 2).toFixed(1));
+          nb.setAttribute("x", (left - padX).toFixed(1));
+          nb.setAttribute("width", (right - left + padX * 2).toFixed(1));
         } catch (_) {}
       };
       requestAnimationFrame(fit);
