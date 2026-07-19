@@ -17,6 +17,45 @@ const WS_TYPE = "hurricane_tracker/data";
 const WS_LAYER_TYPE = "hurricane_tracker/layer";
 const REFRESH_MS = 5 * 60 * 1000;   // re-pull at most every 5 min (coordinator polls every 30)
 const VBW = 800, VBH = 600;
+/* Hard floor for the side rail (v0.2.6 Phase 2 keeps this from the Pass 3
+ * solver). Below this width a 240px column leaves a map too small to read, so
+ * a "Side" preference falls back to Bottom. Physical constraint, not taste. */
+const SIDE_MIN_W = 700;
+/* Side-rail width. Trimmed from 240 (2026-07-19): the rail is text and a narrow
+ * graph, and every px not spent here goes straight back to the map. */
+const SIDE_RAIL_W = 210;
+/* Bottom-rail packing floors (v0.2.6 Phase 3). The rail holds two flow items --
+ * storm data and the at-home graph -- and shares one line when both fit
+ * legibly. Packing along the rail's long axis keeps its thin dimension (height)
+ * from stacking up, which in fill mode hands the reclaimed height straight to
+ * the map. Each floor is the width below which that item stops being legible;
+ * the graph is the only one that gets BETTER with extra width, so it absorbs
+ * whatever slack is left.
+ * The test is a pure WIDTH comparison against the card's own box: no content
+ * measurement and nothing cached, so there is no stale cross-mode metric to rot
+ * (that was the _stackHb bug Phase 1 fought -- do NOT reintroduce a cache).
+ * Deliberately tunable; adjust on glass. */
+const PACK_MIN_W_BAR = 340;   // px storm data needs to share a line
+const PACK_MIN_W_TL = 300;    // px the at-home graph needs to share one
+const PACK_GAP = 10;          // px gutter between packed blocks
+/* The storm pager is NOT a flow item -- it is absolutely placed in a fixed band
+ * at the rail's right-hand end, so its horizontal position is identical in both
+ * layouts and toggling Bottom/Side doesn't make it appear to jump (Aaron,
+ * 2026-07-19). PAGER_INSET is its margin off the foot of the side column; the
+ * rail reserves PAGER_RESERVE so no content can run underneath it. */
+const PAGER_INSET = 16;
+const PAGER_H = 30;   // the nav buttons' diameter -- see .hu-pager button
+/* Everything below is DERIVED, never a separate literal. Hand-set clearances
+ * drifted out of sync with the band once already (the band was widened to
+ * SIDE_RAIL_W while the reserve stayed at 132, and the graph ran underneath).
+ * PAGER_RESERVE clears the band horizontally, with a visible gutter.
+ * PAGER_CLEAR is the vertical room the pager needs; used BOTH as the bottom
+ * bar's floor and as the side column's bottom padding, which is what makes the
+ * pager occupy the identical spot in the two layouts. At exactly PAGER_CLEAR
+ * the pager is also vertically centred, since the inset is equal top and
+ * bottom. */
+const PAGER_RESERVE = SIDE_RAIL_W + 16;
+const PAGER_CLEAR = PAGER_INSET * 2 + PAGER_H;
 
 /* Optional-layer registry (Session E platform). Baseline layers always draw --
  * that's the product. These are LAZY: off by default, requested over the layer
@@ -137,6 +176,58 @@ const MODEL_COLOR = {
 };
 const modelColor = (id) => MODEL_COLOR[id] || "#9E9E9E";
 const LAYER_STORE_KEY = "hurricane-card:layers";
+/* Layout POSITION prefs (v0.2.6 Phase 2) -- deliberately PER DEVICE and never
+ * synced, unlike everything in LAYER_STORE_KEY. The split is intentional: what
+ * a user wants to SEE (layers, wind field, coastal stripe) travels with them
+ * across devices; where it SITS depends on the screen it is being viewed on. A
+ * 43" wall panel wants the info bar in the side rail; the same user's phone
+ * wants it on the bottom, and nobody should have to re-pick on every glance.
+ * Own key, own load/save, never touches _pushPrefs.
+ * SCOPE NOTE: per-DEVICE, not per-CARD. Two hurricane cards on one dashboard
+ * share this. Accepted (Aaron's call) -- per-card keying needs a stable card
+ * id, which HA does not hand out, and derived ids break on dashboard edits.
+ * Keys: "pos" = where the non-map blocks sit ("bottom" | "side", default
+ * bottom); "barOn" / "tlOn" = whether each block is shown at all (default true).
+ *
+ * POSITION IS ONE LEVER FOR BOTH BLOCKS (settled 2026-07-19 after Aaron built
+ * and used the split version): the info bar in one rail and the graph in the
+ * other is a combination nobody would pick, and it costs the card BOTH
+ * dimensions. VISIBILITY stays per-block, because hiding one and keeping the
+ * other is genuinely useful -- bar-off is what promotes the storm name into the
+ * header, and graph-off is what replaced the old `show_timeline` card option.
+ * Position and visibility are different questions; only position merged. */
+const LAYOUT_STORE_KEY = "hurricane-card:layout";
+const LAYOUT_POS = ["bottom", "side"];
+/* The two hideable blocks, in gear-panel order. Neither has a card-config
+ * master: as of v0.2.6 Phase 3 `show_timeline` is GONE and the graph, like the
+ * info bar, is a pure viewer choice -- one lever per thing (Aaron, 2026-07-19).
+ * A leftover `show_timeline: false` in an existing dashboard's YAML is simply
+ * ignored now: the graph comes back on and the viewer turns it off here.
+ * Called out in the v0.2.6 release notes. */
+const LAYOUT_BLOCKS = [
+  { key: "barOn", title: "Storm data" },
+  { key: "tlOn", title: "At-home graph" },
+];
+function loadLayoutPrefs() {
+  let p;
+  try { p = JSON.parse(localStorage.getItem(LAYOUT_STORE_KEY)) || {}; }
+  catch (_) { p = {}; }   // storage blocked (some webviews) -> session-only
+  return (p && typeof p === "object") ? p : {};
+}
+function saveLayoutPrefs(p) {
+  try { localStorage.setItem(LAYOUT_STORE_KEY, JSON.stringify(p)); } catch (_) {}
+}
+/* Where the blocks sit. Unknown/absent -> bottom. */
+function layoutPos(p) {
+  const v = p ? p.pos : null;
+  return LAYOUT_POS.indexOf(v) >= 0 ? v : "bottom";
+}
+/* Whether a block is shown. Default ON for both -- the bar has always shown,
+ * and the graph self-hides when no storm is forecast to reach home, so it costs
+ * nothing when irrelevant and appears at the card's highest-value moment. */
+function layoutOn(p, key) {
+  return !(p && p[key] === false);
+}
 /* Normalize a raw prefs blob (from localStorage OR the HA per-user store) to the
  * current schema. Idempotent, and copies before mutating so a live subscription
  * message object is never altered in place. */
@@ -205,7 +296,7 @@ const COLOR_VARS = {
   background_color: "--hu-bg",
 };
 /* Layer toggles (default on). */
-const TOGGLES = ["show_land", "show_states", "show_coast", "show_cities", "show_labels", "show_scale", "show_home", "show_winds", "show_timeline", "smooth"];
+const TOGGLES = ["show_land", "show_states", "show_coast", "show_cities", "show_labels", "show_scale", "show_home", "show_winds", "smooth"];
 
 function catDotLabel(c) {
   const k = String(c || "").toUpperCase();
@@ -267,6 +358,11 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
  * making each data-bar chunk an unbreakable unit forces the column wide
  * (rejected). Escape FIRST, then wrap: the regex only ever sees escaped text. */
 const escNoWrapParens = (s) => esc(s).replace(/\([^()]*\)/g, (m) => `<span class="hu-nw">${m}</span>`);
+/* At-home graph title. Two halves, each unbreakable, with the ONLY wrap
+ * opportunity at the slash -- so a wide card keeps it on one line and the
+ * narrow side column breaks it cleanly in two rather than mid-phrase. The
+ * slash rides with the first half so a wrapped line never opens with it. */
+const TL_TITLE = `<span class="hu-nw">Storm force winds at home /</span> <span class="hu-nw">Closest to eye</span>`;
 
 /* Failed-source codes -> plain names for the failure notes. The coordinator
  * sends ["NHC"], ["GDACS"], both, or ["storm feed"] as a generic fallback. */
@@ -631,12 +727,20 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // corner legend slot instead (stacks with the stripe/surge notes). RIGHT
   // still falls back to the current field — a bigger promise degrading to a
   // smaller truth isn't misleading.
-  let windSrc = null, windNote = false;
+  let windSrc = null, windNote = false, swathNote = false;
   if (triWind === "left") {
     windSrc = (st.windField && st.windField.length) ? st.windField : null;
     windNote = !windSrc;
-  } else if (triWind === "right")
-    windSrc = (st.windSwath && st.windSwath.length) ? st.windSwath : st.windField;
+  } else if (triWind === "right") {
+    const haveSwath = !!(st.windSwath && st.windSwath.length);
+    // The Swath side KEEPS its fallback to the current field (settled v0.2.5 --
+    // unlike the Current side, which must never silently show a multi-day
+    // forecast swath). But falling back silently still leaves the viewer looking
+    // at something other than what they asked for, so say so: the note fires on
+    // missing swath data whether or not there was a field to fall back to.
+    windSrc = haveSwath ? st.windSwath : st.windField;
+    swathNote = !haveSwath;
+  }
   if (windSrc && windSrc.length)
     for (const w of windSrc) {
       // Union the tier's rings into ONE path so the blobs along the track merge into
@@ -857,11 +961,15 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     const w = padX + 24 + maxCh * 8.4 + padX;
     const h = rows.length * rowH + padY * 2;
     const x0 = 12, y0 = VBH - 12 - h;
-    mlegend.push(`<rect class="hu-mlegend-bg" x="${x0}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
+    // hu-ml-bg / hu-ml-t mark this box for the post-render width fit (see the
+    // fixup after innerHTML). maxCh * 8.4 is only a char-count ESTIMATE, and
+    // when it ran short the right-hand padding came out visibly tighter than the
+    // left -- the box looked lopsided. Measuring the painted text fixes it.
+    mlegend.push(`<rect class="hu-mlegend-bg hu-ml-bg" x="${x0}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
     rows.forEach(([label, col], i) => {
       const cy = y0 + padY + i * rowH + rowH / 2;
       if (col) mlegend.push(`<line class="hu-mlegend-sw" x1="${x0 + padX}" y1="${cy.toFixed(1)}" x2="${x0 + padX + 18}" y2="${cy.toFixed(1)}" stroke="${col}"/>`);
-      mlegend.push(`<text class="hu-mlegend-t" x="${x0 + padX + (col ? 24 : 0)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
+      mlegend.push(`<text class="hu-mlegend-t hu-ml-t" x="${x0 + padX + (col ? 24 : 0)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
     });
     keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
   }
@@ -886,8 +994,15 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
           seen.add(lbl);
           rows.push([lbl, surgeColor(b, i)]);
         });
+      // Two DIFFERENT facts, deliberately not collapsed into one string: a
+      // failed fetch means we don't know, while a clean fetch with zero bands
+      // means NHC has published none. Same distinction the coastal-warning note
+      // draws ("none in effect" vs unavailable) -- never imply an all-clear we
+      // haven't actually confirmed.
       if (!rows.length)
-        rows.push([lay.surge.loading ? "Loading storm surge…" : "Storm surge unavailable", null]);
+        rows.push([lay.surge.loading ? "Loading storm surge…"
+          : lay.surge.failed ? "Storm surge data unavailable"
+          : "No current storm surge data", null]);
     } else if (triStripe === "left" && nhcStorm
         && !(st.ww || []).some((seg) => wwColor(seg.type) && seg.coords && seg.coords.length >= 2)) {
       rows.push(["No coastal warnings in effect", null]);
@@ -897,10 +1012,12 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     // wording on purpose: an empty field is usually a TD (winds under 34 kt)
     // but can also be a fetch soft-fail, and the card can't tell them apart.
     if (windNote)
-      rows.push(["No current wind field", null]);
+      rows.push(["No current wind field data", null]);
+    if (swathNote)
+      rows.push(["No swath data available", null]);
     if (rows.length) {
-      // Swatchless notes ("Storm surge unavailable", "No coastal warnings in
-      // effect") are right-justified: no 18px swatch slot in the box, text
+      // Swatchless notes ("No current storm surge data", "No coastal warnings
+      // in effect") are right-justified: no 18px swatch slot in the box, text
       // anchored END at the box's right padding edge -- so the label hugs the
       // corner even though the box width is only a char-count estimate.
       const hasSw = rows.some((r) => r[1]);
@@ -1001,15 +1118,24 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   return { svg, ctx, popImpact };
 }
 
-function dataBar(st, lay, popImpact) {
-  const m = st.meta || {};
+/* The storm's display name + classification tag, e.g. "Elida (TS)". Hoisted out
+ * of dataBar because the HEADER needs it too: turning the info bar Off (v0.2.6
+ * Phase 2) must not take the storm's name off the card with it. The header line
+ * carries only type + basin ("Tropical Depression - Atlantic"), which names the
+ * weather, not the storm. */
+function stormName(st) {
+  const m = (st && st.meta) || {};
   let name = (m.name || "Storm").replace(/\s*\([^)]*\)\s*$/, "").trim();
-  // Storm type now lives in the top header; strip it from the name so the bar
-  // title reads just the name + classification tag (e.g. "Elida (TS)").
+  // Storm type is shown in the top header; strip it from the name so this reads
+  // just the name + classification tag.
   if (m.type && name.toLowerCase().startsWith(m.type.toLowerCase()))
     name = name.slice(m.type.length).trim();
   const tag = catLabel(m.cat);
-  if (tag) name = `${name} (${tag})`;
+  return tag ? `${name} (${tag})` : name;
+}
+function dataBar(st, lay, popImpact) {
+  const m = st.meta || {};
+  const name = stormName(st);
   const bits = [];
   // m.type intentionally omitted here -- it's shown in the top header now.
   if (m.wind != null) { let s = `${m.wind} ${m.windUnit}`; if (m.gust != null) s += ` (gust ${m.gust})`; bits.push(s); }
@@ -1071,8 +1197,10 @@ function dataBar(st, lay, popImpact) {
  * distance tagged above it; and day/time labels INLINE at the real wind start/stop
  * points (weekday shown only when it changes, thinned to avoid collision, ends
  * always kept). Returns "" (renders nothing) unless home is forecast into a field. */
-function exposureTimeline(st, cfg, vertical) {
-  if (cfg.show_timeline === false) return "";
+/* Returns "" when there is nothing to show -- no exposure rows means no storm
+ * is forecast to bring wind to the user's home, and the block costs zero card
+ * area in that case. That self-hiding is why the graph can default ON. */
+function exposureTimeline(st, vertical) {
   const ex = st.meta && st.meta.exposure;
   if (!ex || !ex.rows || !ex.rows.length) return "";        // hidden when no data
   const ref = ex.refTime != null ? ex.refTime : null;
@@ -1146,8 +1274,8 @@ function exposureTimeline(st, cfg, vertical) {
       vlabs += `<span class="${it.tag ? "hu-tlv-tag" : "hu-tlv-time"}" style="top:${it.y.toFixed(2)}%;transform:${vAnchor(it.y)}">${esc(it.label)}</span>`;
     }
     return `<div class="hu-tl hu-tlv">
-      <div class="hu-tl-title">Storm force winds at home / Closest to eye</div>
-      <div class="hu-tlv-body" style="height:${H}px">
+      <div class="hu-tl-title">${TL_TITLE}</div>
+      <div class="hu-tlv-body" style="min-height:${H}px">
         <div class="hu-tlv-track">${vbars}${vhome}</div>
         <div class="hu-tlv-labels">${vlabs}</div>
       </div>
@@ -1207,7 +1335,7 @@ function exposureTimeline(st, cfg, vertical) {
   });
 
   return `<div class="hu-tl">
-    <div class="hu-tl-title">Storm force winds at home / Closest to eye</div>
+    <div class="hu-tl-title">${TL_TITLE}</div>
     <div class="hu-tl-tagrow">${tag}</div>
     <div class="hu-tl-track">${bars}${home}</div>
     <div class="hu-tl-times">${times}</div>
@@ -1232,17 +1360,63 @@ const STYLE = `
   .hu-wrap.hu-fill { height: 100%; grid-template-rows: auto minmax(0, 1fr) auto; }
   .hu-wrap.hu-fill .hu-conewrap { min-height: 0; }
   .hu-wrap.hu-fill .hu-svg { height: 100%; }
-  .hu-wrap.hu-side { grid-template-columns: minmax(0, 1fr) 240px; grid-template-rows: auto minmax(0, 1fr); }
+  /* v0.2.6 Phase 3: the non-map blocks live in ONE rail, and position is a
+   * single lever for both of them (splitting it produced combinations nobody
+   * wanted -- Aaron, on glass 2026-07-19). Which rail is a class on the
+   * container; both carry .hu-stack for shared base/scrollbar styling:
+   *   .hu-bot   -- the bottom rail, under the map (the default)
+   *   .hu-rail  -- the right side column
+   * Exactly one of the two is emitted per render, so .hu-bot needs no side-mode
+   * placement rule and the side grid stays two rows. Per-block on/off decides
+   * what goes IN the rail, never where the rail is. */
+  .hu-wrap.hu-side { grid-template-columns: minmax(0, 1fr) ${SIDE_RAIL_W}px;
+                     grid-template-rows: auto minmax(0, 1fr); }
   .hu-wrap.hu-side .hu-tag { grid-column: 2; grid-row: 1; }
   .hu-wrap.hu-side .hu-conewrap { grid-column: 1; grid-row: 1 / span 2; }
-  .hu-wrap.hu-side .hu-stack { grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto;
-                               overscroll-behavior: contain; scrollbar-width: thin;
-                               scrollbar-color: var(--secondary-text-color) transparent;
-                               display: flex; flex-direction: column; }
-  .hu-wrap.hu-side .hu-stack > * { flex: none; }
-  /* Storm pager rides the BOTTOM of the side column (Aaron, 2026-07-18);
-   * margin-top:auto collapses to normal flow when content already fills. */
-  .hu-wrap.hu-side .hu-stack .hu-pager { margin-top: auto; padding-top: 10px; }
+  .hu-wrap.hu-side .hu-rail { grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto;
+                              overscroll-behavior: contain; scrollbar-width: thin;
+                              scrollbar-color: var(--secondary-text-color) transparent;
+                              display: flex; flex-direction: column; }
+  .hu-wrap.hu-side .hu-rail > * { flex: none; }
+  /* ...except the at-home graph, which STRETCHES to fill whatever the column
+   * has left (v0.2.6 Phase 2). Without this the vertical track sat at its 190px
+   * floor with dead rail beneath it. Must out-specify the 'flex: none' above,
+   * hence the full .hu-wrap.hu-side .hu-rail prefix. min-height:0 lets it
+   * shrink below content size when the column is tight (the rail scrolls). */
+  .hu-wrap.hu-side .hu-rail .hu-tlv { flex: 1 1 auto; min-height: 0;
+                                      display: flex; flex-direction: column; }
+  .hu-wrap.hu-side .hu-rail .hu-tlv .hu-tlv-body { flex: 1 1 auto; min-height: 0; }
+  /* Storm pager: ONE absolute rule, positioned against the CARD (.hu-wrap) and
+   * not against either rail, so it occupies the identical spot in both layouts
+   * and toggling Bottom/Side cannot move it a pixel in either axis (Aaron,
+   * 2026-07-19). Centred in a rail-width band at the card's right edge, lifted
+   * PAGER_INSET off the card's bottom. There is deliberately NO per-mode
+   * override here -- a mode-specific rule is exactly how it started drifting.
+   * Under the gear panel's z-index on purpose: the panel is transient. */
+  .hu-pager { position: absolute; z-index: 2; display: flex; align-items: center;
+              justify-content: center; gap: 10px; padding: 0;
+              right: 0; width: ${SIDE_RAIL_W}px;
+              bottom: var(--hu-pager-b, ${PAGER_INSET}px); }
+  /* Keep content out from under it. Horizontally: the bottom bar's last flow
+   * item clears the band. Vertically: the bottom bar gets PAGER_CLEAR as a floor
+   * and the side column the same value as bottom padding -- the same number in
+   * both places, so the pager sits the same distance off the card's bottom edge
+   * either way. In side mode this is also what stops the stretched vertical
+   * graph from running its bottom labels under the buttons. */
+  .hu-wrap.hu-haspager .hu-bot > :last-child { padding-right: ${PAGER_RESERVE}px; }
+  .hu-wrap.hu-haspager .hu-bot { min-height: ${PAGER_CLEAR}px; }
+  .hu-wrap.hu-haspager .hu-rail { padding-bottom: var(--hu-pager-clear, ${PAGER_CLEAR}px); }
+  /* Bottom-rail packing (Phase 3): storm data and the graph share one line.
+   * Sizing is NOT equal shares -- data takes what its text needs and the graph
+   * absorbs every remaining px, since it is the only one that improves with
+   * width. min-width:0 on the graph keeps its absolutely positioned time labels
+   * from forcing the flex base wider than its share; align-items:flex-start so
+   * the shorter item doesn't stretch to the taller one's height.
+   * The wrapper is EMITTED ONLY for the row tier; stacked, the blocks are plain
+   * siblings and every pre-existing bottom-rail rule applies untouched. */
+  .hu-packrow { display: flex; align-items: flex-start; gap: ${PACK_GAP}px; }
+  .hu-packrow > .hu-bar { flex: 0 1 auto; min-width: 0; }
+  .hu-packrow > .hu-tl { flex: 1 1 0; min-width: 0; }
   .hu-nw { white-space: nowrap; }
   /* Side column: each info batch (.hu-chunk) is its own line and separators
    * hide -- batches stay together when there's room and only wrap internally
@@ -1294,6 +1468,9 @@ const STYLE = `
     background: var(--secondary-text-color); border-radius: 4px; }
   .hu-panel-row.hu-na { opacity: .45; }
   .hu-panel-note { font: 400 10px/1.2 sans-serif; opacity: .7; margin-left: 4px; }
+  /* Standalone note under a segmented control (not an inline group suffix):
+   * full width, its own line, no left indent to line up with the pill. */
+  .hu-lay-note { font: 400 10px/1.3 sans-serif; opacity: .7; margin: 5px 2px 0; }
   .hu-panel-group { font: 700 10.5px/1 sans-serif; letter-spacing: .08em; text-transform: uppercase;
                     color: var(--secondary-text-color); margin: 12px 0 6px; display: flex;
                     align-items: baseline; gap: 6px; }
@@ -1390,6 +1567,12 @@ const STYLE = `
   .hu-tl-time { position: absolute; top: 7px; white-space: nowrap; font: 400 11px/1 sans-serif; color: var(--secondary-text-color); }
   /* Vertical timeline (side column): a real vertical track with horizontal
    * text beside it -- never rotated text. */
+  /* H is a FLOOR, not a height (v0.2.6 Phase 2): in the side column the body
+   * grows to eat the leftover space below it, so the track spans the column
+   * instead of stranding a block of empty rail under a stubby 190px graph.
+   * The stretch rules live with the side-mode block further down -- they have
+   * to out-specify the side-mode 'flex: none' on .hu-stack children.
+   * NB no backticks in STYLE comments: the whole sheet is a template literal. */
   .hu-tlv-body { display: flex; gap: 9px; }
   .hu-tlv-track { position: relative; flex: none; width: 16px; height: 100%; border-radius: 3px;
                   background: var(--divider-color, rgba(127,127,127,.2)); }
@@ -1409,7 +1592,7 @@ const STYLE = `
   .hu-msg .hu-msg-title { font-size: 18px; font-weight: 700; color: var(--primary-text-color); margin-top: 8px; }
   .hu-msg .hu-msg-sub { font-size: 14px; margin-top: 4px; }
   .hu-stale { font-size: 12px; color: var(--warning-color, #d68b00); padding: 0 14px 10px; }
-  .hu-pager { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 0 0 12px; }
+
   .hu-pager button { border: none; background: var(--secondary-background-color); color: var(--primary-text-color);
                      border-radius: 50%; width: 30px; height: 30px; font-size: 16px; cursor: pointer; }
   .hu-pager .hu-page { font-size: 13px; color: var(--secondary-text-color); min-width: 40px; text-align: center; }
@@ -1425,11 +1608,27 @@ class HurricaneCard extends HTMLElement {
     this._layerPrefs = loadLayerPrefs(); this._panelOpen = false;
     this._advOpen = false; this._advTitle = ""; this._advBody = ""; this._layerCache = {};
     this._layerBusy = {};   // in-flight layer fetches, keyed like _layerCache
-    // Pass 3 dynamic layout: fill-height + auto bar placement, decided from
-    // measurements only (no config). _stackHb caches the bottom-mode height of
-    // the non-map stack so the side-vs-bottom comparison stays feedback-free
-    // while side mode is active (you can't measure bottom-mode heights there).
-    this._fillMode = false; this._layoutMode = "bottom"; this._stackHb = null;
+    // Layout POSITION prefs (v0.2.6 Phase 2): per-device, own store, never
+    // synced. Kept separate from _layerPrefs on purpose -- see LAYOUT_STORE_KEY.
+    this._layoutPrefs = loadLayoutPrefs();
+    // Pass 3 dynamic layout. Fill-height is still MEASURED (it detects a height
+    // the dashboard imposed, which is a fact about the box, not a preference).
+    // Placement is NOT measured -- as of v0.2.6 Phase 2/3 each block carries the
+    // viewer's explicit Bottom/Off/Side choice.
+    // _pos = the RESOLVED position (what _layoutCheck decided AFTER the physical
+    // gates), NOT the raw preference. Starts at bottom because honoring "side"
+    // needs a measurement we haven't taken yet. Visibility needs no measurement
+    // and is read straight from prefs at render time.
+    // _boxW is the last measured card width; _present is which rail items the
+    // last render actually emitted. Together they decide the bottom-rail tier
+    // (see _railTier) -- width is a measurement, presence is data, and neither
+    // is a cached LAYOUT metric, so the _stackHb hazard doesn't apply.
+    this._fillMode = false;
+    this._pos = "bottom";
+    this._boxW = 0;
+    this._present = { bar: false, tl: false, pager: false };
+    this._sideOn = false;   // set during _render; drives the .hu-side class
+    this._hadData = false;   // arms the first-data re-solve (see _render)
     this._layoutRaf = 0; this._inLayout = false;
     this._deferT = 0; this._deferN = 0;   // zero-rect retry (see _deferLayout)
   }
@@ -1461,7 +1660,18 @@ class HurricaneCard extends HTMLElement {
     // Pass 3: one ResizeObserver drives the whole dynamic layout. Fill-height
     // latches only until detach: a fresh attach (moving the card between
     // views/dashboards recreates or reattaches it) re-detects from scratch.
-    this._fillMode = false; this._layoutMode = "bottom";
+    // Phase 3: reset the resolved position and the measured width the same way.
+    // Both start at their un-measured defaults; _layoutCheck re-derives them for
+    // the new box. Nothing measured survives a reattach BY DESIGN -- that was
+    // Phase 1's _stackHb bug, a metric from the old box reused in the new one.
+    // Do not cache anything here. (Visibility needs no reset: it is read from
+    // prefs at render time, not held as layout state.)
+    this._fillMode = false;
+    this._pos = "bottom";
+    this._boxW = 0;
+    this._sideOn = false;
+    // _hadData re-arms the first-data re-solve (see the end of _render).
+    this._hadData = false;
     if (!this._ro) {
       this._ro = new ResizeObserver(() => {
         if (this._layoutRaf) return;   // rAF-debounce the resize storm of a drag
@@ -1648,6 +1858,50 @@ class HurricaneCard extends HTMLElement {
     this._render();
   }
 
+  /* v0.2.6 layout controls. Deliberately NOT _applyTri: these write the
+   * per-device store and do NOT call _pushPrefs, so the choice never follows the
+   * user to a differently-shaped screen. _render's tail re-solves the layout, so
+   * no explicit _layoutCheck() in either.
+   * Position: ONE lever moving both blocks together. */
+  _applyLayoutPos(v) {
+    if (LAYOUT_POS.indexOf(v) < 0) return;
+    this._layoutPrefs = this._layoutPrefs || {};
+    this._layoutPrefs.pos = v;
+    saveLayoutPrefs(this._layoutPrefs);
+    // "bottom" needs no measurement, so paint it in this frame. "side" holds the
+    // current position until _layoutCheck confirms the physical gates -- the
+    // same one-frame settle Phase 2 shipped with.
+    if (v === "bottom") this._pos = "bottom";
+    this._render();
+  }
+
+  /* How the BOTTOM rail arranges its two flow items, given the measured card
+   * width. The pager is not considered here -- it is pinned to the card corner
+   * and only reserves width. Two tiers:
+   *   "row"   -- ONE line: [storm data] [graph, absorbing the slack]
+   *   "stack" -- graph full width on top, storm data under it
+   * Graph-on-top when stacked is deliberate (Aaron, on glass 2026-07-19): a
+   * narrow card can't give the graph a useful share of a shared line, and a
+   * full-width time axis is worth more up against the map than a half-width one.
+   * The side rail always stacks, data first -- it is a column, not a line.
+   * Pure width arithmetic against the item floors; no DOM measurement. */
+  _railTier(w, p) {
+    if (this._pos === "side") return "stack";
+    if (!p.bar || !p.tl) return "stack";   // nothing to arrange with one item
+    const need = PACK_MIN_W_BAR + PACK_MIN_W_TL + PACK_GAP
+      + (p.pager ? PAGER_RESERVE : 0);
+    return w >= need ? "row" : "stack";
+  }
+
+  /* Visibility: per block, and never a measurement -- apply and paint at once. */
+  _applyLayoutVis(key, on) {
+    if (!key) return;
+    this._layoutPrefs = this._layoutPrefs || {};
+    this._layoutPrefs[key] = !!on;
+    saveLayoutPrefs(this._layoutPrefs);
+    this._render();
+  }
+
   _msg(icon, title, sub, spin) {
     return `<div class="hu-msg"><ha-icon class="hu-msg-icon${spin ? " hu-spin" : ""}" icon="${icon}"></ha-icon>
       <div class="hu-msg-title">${esc(title)}</div>${sub ? `<div class="hu-msg-sub">${esc(sub)}</div>` : ""}</div>`;
@@ -1666,6 +1920,11 @@ class HurricaneCard extends HTMLElement {
     const cfg = this._config || {};
     const d = this._data;
     let body;
+    // Cleared up front so the message states (Loading / All clear / outage) can
+    // never inherit a stale side-rail or pager class from the storm render
+    // before them. The storm branch below sets both for real.
+    this._sideOn = false;
+    this._present = { bar: false, tl: false, pager: false };
 
     if (!d) {
       body = this._err
@@ -1689,8 +1948,17 @@ class HurricaneCard extends HTMLElement {
       }
       // Title chunks ride the same keep-together rule as the data bar: the
       // side column stacks type / basin as whole lines (separator hidden).
+      // v0.2.6 Phase 2: with the info bar Off the header is the only thing left
+      // identifying the storm, and type + basin alone doesn't say WHICH storm.
+      // Append the name in that case only -- with the bar on it would duplicate
+      // the bar's title. A card-config `title` is the dashboard owner's explicit
+      // override and is left exactly as they wrote it.
+      const barOn = layoutOn(this._layoutPrefs, "barOn");
+      const tlOn = layoutOn(this._layoutPrefs, "tlOn");
+      const nameChunk = !barOn
+        ? `<span class="hu-sep"> · </span><span class="hu-chunk">${esc(stormName(st))}</span>` : "";
       const tagHtml = cfg.title != null ? esc(cfg.title)
-        : `<span class="hu-chunk">${esc((st.meta && st.meta.type) || "Storm")}</span><span class="hu-sep"> \u00b7 </span><span class="hu-chunk">${esc((st.meta && st.meta.basinName) || "")}</span>`;
+        : `<span class="hu-chunk">${esc((st.meta && st.meta.type) || "Storm")}</span><span class="hu-sep"> \u00b7 </span><span class="hu-chunk">${esc((st.meta && st.meta.basinName) || "")}</span>${nameChunk}`;
       const prefs = this._layerPrefs || {};
       // E4 model tracks: resolve this storm's layer state for the draw --
       // cached list, cached failure, or kick an on-demand fetch (loading).
@@ -1723,6 +1991,30 @@ class HurricaneCard extends HTMLElement {
       // middle = off, right = alternate), then the independent toggles, with
       // advisory text LAST; a short perf note closes the panel.
       let panelRows = "", lastGroup = null;
+      // v0.2.6 Phase 2/3: card-SHAPE controls sit above the map-CONTENT sliders.
+      // Same segmented look as the tri groups, deliberately different wiring:
+      // data-lay (not data-tri) routes the click to the per-device layout store
+      // instead of the synced prefs blob. NEITHER block has a card-config master
+      // -- Phase 3 deleted show_timeline outright. Aaron's call: the card should
+      // behave consistently, one lever per thing, and both are viewer choices.
+      // ONE position control for both blocks, then a plain on/off switch each.
+      // The segments read the raw PREFERENCE (not the resolved position) so the
+      // panel shows what the user asked for even when a gate downgraded it; the
+      // note explains the downgrade. Switches reuse the .hu-sw row markup from
+      // the layer toggles but carry data-layvis, keeping them off both the
+      // synced-prefs path and the lazy-fetch path.
+      {
+        const cur = layoutPos(this._layoutPrefs);
+        const seg = (set, lbl) =>
+          `<button class="hu-seg-btn${cur === set ? " hu-sel" : ""}" data-lay="pos" data-set="${set}">${esc(lbl)}</button>`;
+        panelRows += `<div class="hu-panel-group">Info bar</div>
+          <div class="hu-seg" role="group" aria-label="Info bar position">
+            ${seg("bottom", "Bottom")}${seg("side", "Side")}
+          </div>`;
+        for (const b of LAYOUT_BLOCKS)
+          panelRows += `<label class="hu-panel-row"><span class="hu-row-lbl">${esc(b.title)}</span><input type="checkbox" class="hu-sw" data-layvis="${b.key}" ${layoutOn(this._layoutPrefs, b.key) ? "checked" : ""}/></label>`;
+        panelRows += `<div class="hu-lay-note">Side needs a wide card with a set height — otherwise it falls back to Bottom. The at-home graph only appears when a storm is forecast to reach your home. Saved on this device only.</div>`;
+      }
       for (const t of TRI_GROUPS) {
         const na = t.nhcOnly && !nhcSt;
         const v = na ? t.def : triState(prefs, t.key);
@@ -1760,13 +2052,39 @@ class HurricaneCard extends HTMLElement {
           <div class="hu-adv-head"><span>${esc(this._advTitle || "Advisory")}</span>
           <button class="hu-adv-close" aria-label="Close">&#x2715;</button></div>
           <div class="hu-adv-body">${this._advBody || ""}</div></div>` : "";
-      // Pass 3: the whole non-map stack lives in ONE .hu-stack wrapper so the
-      // dynamic layout can move it below the map (default) or into the right
-      // side column purely via grid classes -- no DOM surgery. The advisory
-      // overlay stays outside (absolute over the whole card).
+      // v0.2.6 Phase 3: build the two placeable blocks once, then DISTRIBUTE
+      // them into the bottom rail and/or the side rail per the positions
+      // _layoutCheck resolved. Grid classes do the placing -- the only DOM
+      // surgery is which container each block is written into. The advisory
+      // overlay stays outside both (absolute over the whole card).
+      // NB "present" means non-empty HTML, not merely "switched on": the graph
+      // self-hides when no storm is forecast to bring wind to the user's home,
+      // and an empty side rail must not be emitted (it would eat 240px of map).
+      const side = this._pos === "side";
+      const barHtml = barOn ? `<div class="hu-bar">${dataBar(st, lay, popImpact)}</div>` : "";
+      const tlHtml = tlOn ? exposureTimeline(st, side) : "";
+      this._sideOn = !!(side && (barHtml || tlHtml));
+      // Record what is actually on screen so _layoutCheck can re-run the same
+      // tier arithmetic on resize without re-deriving the storm's data.
+      this._present = { bar: !!barHtml, tl: !!tlHtml, pager: !!pager };
+      const tier = this._railTier(this._boxW, this._present);
+      // Order: shared line reads [data][graph]; stacked BOTTOM puts the graph on
+      // top (full-width time axis against the map); the side column keeps data
+      // first, since a column reads top-down as identity-then-detail.
+      let inner;
+      if (tier === "row") inner = `<div class="hu-packrow">${barHtml}${tlHtml}</div>`;
+      else if (side) inner = barHtml + tlHtml;
+      else inner = tlHtml + barHtml;
+      // The staleness note always closes the rail on its own line -- it is a
+      // warning, and inlining it would bury it.
+      const railHtml = this._sideOn ? `<div class="hu-stack hu-rail">${inner}${stale}</div>` : "";
+      const botHtml = this._sideOn ? "" : `<div class="hu-stack hu-bot">${inner}${stale}</div>`;
+      // Pager sits OUTSIDE both rails, as a direct child of the wrap it is
+      // positioned against -- that is what pins it to one spot on the card
+      // regardless of which rail is showing.
       body = `<div class="hu-tag">${tagHtml}</div>
         <div class="hu-conewrap">${svg}${tools}</div>
-        <div class="hu-stack"><div class="hu-bar">${dataBar(st, lay, popImpact)}</div>${exposureTimeline(st, cfg, this._layoutMode === "side")}${pager}${stale}</div>${adv}`;
+        ${railHtml}${botHtml}${pager}${adv}`;
     } else if (d.reason === "none_matched") {
       const n = d.activeAnywhere || 0;
       body = this._msg("mdi:map-marker-off", "No storms near you",
@@ -1798,7 +2116,9 @@ class HurricaneCard extends HTMLElement {
     this.style.display = "";
     // Pass 3: emit the current layout-mode classes inline so a background
     // re-render paints straight into the active layout (no one-frame snap).
-    const wrapCls = "hu-wrap" + (this._fillMode ? " hu-fill" : "") + (this._layoutMode === "side" ? " hu-side" : "");
+    const wrapCls = "hu-wrap" + (this._fillMode ? " hu-fill" : "")
+      + (this._sideOn ? " hu-side" : "")
+      + (this._present.pager ? " hu-haspager" : "");
     this.shadowRoot.innerHTML = `<style>${STYLE}</style><ha-card><div class="${wrapCls}" style="${this._styleVars()}">${body}</div></ha-card>`;
     this.shadowRoot.querySelectorAll("[data-nav]").forEach((b) =>
       b.addEventListener("click", () => {
@@ -1840,15 +2160,27 @@ class HurricaneCard extends HTMLElement {
     // E5 tri-group segmented buttons (Material 3 pattern: one segment per
     // state, selected segment filled -- "Off" is its own labeled segment).
     this.shadowRoot.querySelectorAll(".hu-seg-btn").forEach((el) =>
-      el.addEventListener("click", () =>
-        this._applyTri(el.getAttribute("data-tri"), el.getAttribute("data-set"))));
+      el.addEventListener("click", () => {
+        // Two kinds of segmented control share this look and class: layout
+        // POSITION (data-lay -> per-device store) and the tri groups (data-tri
+        // -> synced prefs). The attribute decides which store the click lands in.
+        const set = el.getAttribute("data-set");
+        const lay = el.getAttribute("data-lay");
+        if (lay) this._applyLayoutPos(set);
+        else this._applyTri(el.getAttribute("data-tri"), set);
+      }));
+    // Block VISIBILITY switches (per-device store, never synced). Distinct attr
+    // from data-layer so they don't touch the lazy-fetch/sync path.
+    this.shadowRoot.querySelectorAll("input[data-layvis]").forEach((el) =>
+      el.addEventListener("change", () =>
+        this._applyLayoutVis(el.getAttribute("data-layvis"), el.checked)));
     const doc = this.shadowRoot.querySelector(".hu-doc");
     doc && doc.addEventListener("click", () => this._openAdvisory());
     const closeBtn = this.shadowRoot.querySelector(".hu-adv-close");
     closeBtn && closeBtn.addEventListener("click", () => { this._advOpen = false; this._render(); });
 
-    // Swatchless note fixup ("No coastal warnings in effect" / "Storm surge
-    // unavailable"): the backing rect's width at build time is only a char-count
+    // Swatchless note fixup ("No coastal warnings in effect" / "No current
+    // storm surge data"): the backing rect's width at build time is only a char-count
     // estimate. Once the text has actually PAINTED (rAF, not synchronously --
     // measuring right after innerHTML can catch pre-layout/pre-font metrics and
     // size the box wrong), fit the rect to the text's real bbox + padding. Re-run
@@ -1861,9 +2193,9 @@ class HurricaneCard extends HTMLElement {
         if (!nts.length || !nb) return;
         try {
           // Notes can STACK (e.g. "No coastal warnings in effect" over "No
-          // current wind field"): fit the shared rect to the UNION of every
-          // note's measured bbox — right edges align (text-anchor end), the
-          // widest note sets the left edge.
+          // current wind field data" over "No swath data available"): fit the
+          // shared rect to the UNION of every note's measured bbox — right edges
+          // align (text-anchor end), the widest note sets the left edge.
           let left = Infinity, right = -Infinity;
           nts.forEach((nt) => {
             const bx = nt.getBBox();
@@ -1882,6 +2214,33 @@ class HurricaneCard extends HTMLElement {
       if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fit());
     }
 
+    // Model-legend width fixup. Same problem, mirrored geometry: those rows are
+    // LEFT-anchored behind swatches, so the box's left padding is exact and it is
+    // the RIGHT edge that rides on the char-count estimate. Measure the painted
+    // text and set the width so both sides get the same padX. Runs on rAF and
+    // again once fonts settle, exactly like the note fit; a zero-width measure
+    // (hidden tab) leaves the estimated box alone.
+    {
+      const fitMl = () => {
+        const ts = this.shadowRoot ? this.shadowRoot.querySelectorAll("text.hu-ml-t") : [];
+        const bg = this.shadowRoot && this.shadowRoot.querySelector("rect.hu-ml-bg");
+        if (!ts.length || !bg) return;
+        try {
+          let right = -Infinity;
+          ts.forEach((t) => {
+            const bx = t.getBBox();
+            if (bx && bx.width > 0) right = Math.max(right, bx.x + bx.width);
+          });
+          if (!(right > -Infinity)) return;
+          const padX = 8;
+          const x0 = parseFloat(bg.getAttribute("x")) || 0;
+          bg.setAttribute("width", Math.max(0, right - x0 + padX).toFixed(1));
+        } catch (_) {}
+      };
+      requestAnimationFrame(fitMl);
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fitMl());
+    }
+
     // Rebuild attaches a fresh gesture layer. Whether it starts at the default
     // frame or restores the user's zoom/pan is decided in _setupPanZoom: a storm
     // switch or a storm-identity change resets; a background poll of the SAME storm
@@ -1892,6 +2251,26 @@ class HurricaneCard extends HTMLElement {
     // replaces this DOM wholesale (listeners and all) -- so there are never
     // two gesture layers wired to one svg.
     this._layoutCheck();
+    // FIRST DATA RENDER: the synchronous pass above runs in the same task as the
+    // innerHTML write, so it can measure pre-layout / pre-font metrics. Fill
+    // detection compares the host box against the wrap's NATURAL height, and a
+    // pre-font wrap measures short -- read it once at the wrong moment and the
+    // card can miss fill mode, or latch it, for the rest of the session. So
+    // re-solve after layout settles, and again after web fonts swap (text
+    // metrics move the wrap height). NB side-vs-bottom used to be the bigger
+    // hazard here (a cached _stackHb estimate taken on this very pass); v0.2.6
+    // Phase 2 made placement an explicit preference, so fill is now the only
+    // thing this pass measures.
+    // Gate on the MAP being present: the "Loading" / no-data states render a
+    // message with no .hu-conewrap, and _layoutCheck bails on those. Arming
+    // there would spend the one re-solve on a state that never needed it and
+    // leave the real first data render unprotected.
+    if (!this._hadData && this.shadowRoot && this.shadowRoot.querySelector(".hu-conewrap")) {
+      this._hadData = true;
+      requestAnimationFrame(() => this._layoutCheck());
+      if (document.fonts && document.fonts.ready)
+        document.fonts.ready.then(() => this._layoutCheck());
+    }
   }
 
   /* ---- Pass 3: dynamic layout (fill-height + auto bar placement) ------------
@@ -1901,10 +2280,16 @@ class HurricaneCard extends HTMLElement {
    * getGridOptions rows). Detected by comparing host vs wrap height in normal
    * flow; once seen, fill latches until the element re-attaches (a fresh attach
    * re-detects from scratch -- see connectedCallback).
-   * SIDE: chosen over bottom only when it yields the BIGGER drawn map (the meet
-   * scale of the 800x600 frame), with 8% hysteresis so drag-resize in the
-   * sections editor doesn't flip-flop at the threshold, and a 700px width floor.
-   * Two states only: below (default) or right column. No left, no top. */
+   * SIDE: as of v0.2.6 Phase 2 this is the VIEWER'S choice (gear panel ->
+   * Bottom/Off/Side per block, stored per device), not a measurement. The old
+   * meet-scale comparison, its 8% hysteresis and the cached _stackHb estimate
+   * are gone. Two states only: below (default) or right column. No left, no
+   * top, and no Auto -- settled with Aaron: we can't anticipate every
+   * dashboard's layout, so the user gets the wheel.
+   * Phase 3 keeps position a SINGLE lever for both blocks (splitting it produced
+   * combinations nobody wanted -- Aaron, on glass 2026-07-19); what this pass
+   * adds is the one automatic thing left: how a bottom-rail PAIR arranges
+   * itself. Per-block on/off is not resolved here -- it needs no measurement. */
   _layoutCheck() {
     if (this._inLayout) return;   // the flip re-render re-enters; state is already final
     const wrap = this.shadowRoot && this.shadowRoot.querySelector(".hu-wrap");
@@ -1912,36 +2297,67 @@ class HurricaneCard extends HTMLElement {
     if (!wrap || !cone) return;   // message states keep the plain layout
     const host = this.getBoundingClientRect();
     if (!host.width || !host.height) return;   // hidden tab -> keep current mode
+    // HARDENING: getBoundingClientRect reports the TRANSFORMED box. An ancestor
+    // mid-animation (swipe-card slide, animated-dashboard flip) therefore hands
+    // us scaled/rotated dimensions that have nothing to do with the real layout
+    // box, and the solver latches the garbage -- observed live: a 948x685 card
+    // measured 299x1405. offsetWidth/offsetHeight are border-box reads and are
+    // transform-independent, so a disagreement between the two IS the signal
+    // that a transform is active. Skip the pass and retry once it settles.
+    if (Math.abs(host.width - this.offsetWidth) > 2
+        || Math.abs(host.height - this.offsetHeight) > 2) { this._deferLayout(); return; }
     let fill = this._fillMode;
     if (!fill) {
       const wh = wrap.getBoundingClientRect().height;
       if (!wh) { this._deferLayout(); return; }   // fresh shadow DOM, not laid out yet
       fill = Math.abs(host.height - wh) > 8;
     }
-    let side = false;
-    if (fill) {
-      const tagEl = wrap.querySelector(".hu-tag");
-      const stackEl = wrap.querySelector(".hu-stack");
-      let Sb;   // bottom-mode height of the non-map stack (tag + bar/timeline/...)
-      if (this._layoutMode !== "side") {
-        Sb = (tagEl ? tagEl.offsetHeight : 0) + (stackEl ? stackEl.offsetHeight : 0);
-        this._stackHb = Sb;
-      } else {
-        Sb = this._stackHb != null ? this._stackHb : 150;
-      }
-      const SIDE_W = 240;
-      const scaleB = Math.min(host.width / VBW, Math.max(0, host.height - Sb) / VBH);
-      const scaleS = host.width >= 700
-        ? Math.min((host.width - SIDE_W) / VBW, host.height / VBH) : 0;
-      side = this._layoutMode === "side";
-      if (side) { if (scaleB > scaleS * 1.08) side = false; }
-      else if (scaleS > scaleB * 1.08) side = true;
-    }
-    const mode = side ? "side" : "bottom";
-    const flip = mode !== this._layoutMode;
-    this._fillMode = fill; this._layoutMode = mode;
+    // v0.2.6 Phase 2/3: placement is the viewer's call, so there is nothing to
+    // solve here -- just two physical gates on honoring a "Side" preference:
+    //   fill      -- a content-height card has no spare vertical room to trade
+    //                for a rail; the blocks sit under the map as they always did.
+    //   SIDE_MIN_W -- a 240px column beside a narrower card leaves an unreadable
+    //                map. This fallback is silent, hence the panel's note.
+    // Both are facts about the box, not preferences. Nothing is cached, so
+    // nothing can go stale -- the whole _stackHb feedback problem is gone.
+    const canSide = fill && host.width >= SIDE_MIN_W;
+    const want = layoutPos(this._layoutPrefs);
+    const pos = want === "side" && !canSide ? "bottom" : want;
+    // BOTTOM-RAIL PACKING (Phase 3) -- the one automatic behavior in this layout.
+    // Re-run the same tier arithmetic _render used, against the fresh width and
+    // the item presence that render recorded, and re-render if the answer moved.
+    // Presence is data (which blocks are on, whether the graph self-hid, whether
+    // there is more than one storm) and does not change with the box, so reusing
+    // it here is safe -- it is not a cached LAYOUT metric.
+    const prevPos = this._pos;
+    this._pos = pos;   // _railTier reads it for the side-rail short-circuit
+    const tier = this._railTier(host.width, this._present);
+    const wasTier = this._railTier(this._boxW, this._present);
+    // Compare against the RENDERED state (_pos/_boxW are what _render last drew)
+    // rather than a separate cached signature -- one source of truth, and a
+    // position already painted by _applyLayoutPos costs no second render.
+    const flip = pos !== prevPos || tier !== wasTier;
+    this._fillMode = fill; this._boxW = host.width;
     wrap.classList.toggle("hu-fill", fill);
-    wrap.classList.toggle("hu-side", side);
+    // PAGER PLACEMENT. The pager centres vertically on the BOTTOM bar, and that
+    // same offset is then held in side mode so switching Bottom/Side never moves
+    // it (Aaron, 2026-07-19). Only the bottom bar has a height to centre in, so
+    // measure it while it is on screen and keep the number.
+    // This IS a value carried across modes, which is the shape of the _stackHb
+    // bug -- so note the difference: _stackHb was a stale estimate the solver FED
+    // BACK IN to pick a mode, so a wrong read locked in a wrong layout forever.
+    // This decides nothing; it only positions one absolute element, is re-taken
+    // every pass the bottom bar is visible, and a bad read is a few px of offset
+    // that the next bottom-mode pass corrects. Never let it gate a mode choice.
+    const bot = wrap.querySelector(".hu-bot");
+    const barH = bot ? bot.offsetHeight : 0;
+    if (barH > 0) {
+      const off = Math.max(PAGER_INSET, Math.round((barH - PAGER_H) / 2));
+      this.style.setProperty("--hu-pager-b", off + "px");
+      // The side column must clear whatever offset the bottom bar produced, or
+      // the stretched vertical graph runs its labels under the buttons.
+      this.style.setProperty("--hu-pager-clear", (off + PAGER_H + PAGER_INSET) + "px");
+    }
     if (flip) {
       // The timeline emits a different variant per mode -- rebuild the DOM.
       this._inLayout = true;
@@ -2226,7 +2642,6 @@ const EDITOR_FIELDS = [
   { key: "show_scale", label: "Show offshore mileage scale", type: "bool", def: true },
   { key: "show_home", label: "Show home marker", type: "bool", def: true },
   { key: "show_winds", label: "Show wind field", type: "bool", def: true },
-  { key: "show_timeline", label: "Show at-home wind timeline", type: "bool", def: true },
   { key: "smooth", label: "Smooth coastlines", type: "bool", def: true },
   { key: "coast_color", label: "Coastline color", type: "color" },
   { key: "land_color", label: "Land fill color", type: "color" },
