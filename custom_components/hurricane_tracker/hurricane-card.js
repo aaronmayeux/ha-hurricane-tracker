@@ -461,18 +461,131 @@ const basePath = (proj, coords, closed, smooth) => {
   return smooth ? smoothPath(pts, closed) : straightPath(pts, closed);
 };
 
-/* ---- forecast-dot time-label declutter (spoke placement + thinning) ------- */
-const CHAR_W = 9.2, LBL_H = 17, R_OUT = 16, MIN_GAP = 34;
-function labelBox(cx, cy, w, deg) {
-  const r = deg * Math.PI / 180, ux = Math.cos(r), uy = Math.sin(r);
-  const leftward = Math.abs(deg) > 90;
-  const nx = cx + ux * R_OUT, ny = cy + uy * R_OUT;
-  const fx = nx + ux * (leftward ? -w : w), fy = ny + uy * (leftward ? -w : w);
-  const pad = LBL_H / 2;
-  return { x1: Math.min(nx, fx) - pad, y1: Math.min(ny, fy) - pad,
-           x2: Math.max(nx, fx) + pad, y2: Math.max(ny, fy) + pad };
+/* ---- forecast-dot time-label placement (shared-angle runs) ----------------
+ * Each time label rides a SPOKE off its dot: the near end sits R_OUT from the
+ * dot centre and the text radiates outward, so the label visibly points back at
+ * the dot it belongs to. Two rules govern the angle:
+ *
+ *   1. Text never tilts more than 45 degrees off horizontal. Past that it stops
+ *      being readable on a phone.
+ *   2. Labels SHARE an angle. Not "every label solves for itself" (that was the
+ *      old placer -- it scattered labels onto both sides at four different
+ *      tilts and laid them straight along a horizontal track), and not "one
+ *      angle for the whole track, drop the rest" either. The set is partitioned
+ *      into contiguous RUNS along the track; each run shares one angle. Four
+ *      labels at one angle and four at another beats seven plus a lone
+ *      straggler, so a singleton run is penalised hard and a label that must
+ *      move drags its neighbours with it when they also fit at the new angle
+ *      (Aaron, 2026-07-19).
+ *
+ * Solved as a small dynamic program -- see placeLabels. Dropping a label is
+ * legal but priced as a last resort: a missing timestamp is real information
+ * loss, and the dot still carries the category. */
+const CHAR_W = 9.2, LBL_H = 17, MIN_GAP = 34;
+/* Forecast-dot geometry. These MUST match what the dot renderer draws and what
+ * .hu-fdot / .hu-now-ring set in STYLE -- they are the same circles, described
+ * once here so the label clearances can be DERIVED rather than hand-tuned. A
+ * hand-set 16px clearance sat 0.25px inside the current-position ring and the
+ * "now" label printed straight over the white band (Aaron, 2026-07-19). */
+const FDOT_R = 12;           // .hu-fdot radius
+const FDOT_SW = 1;           // .hu-fdot stroke-width
+const NOW_RING_R = 15;       // .hu-now-ring radius (current position only)
+const NOW_RING_SW = 2.5;     // .hu-now-ring stroke-width
+/* Outer INK edge of each dot -- a stroke straddles its path, so half of it
+ * sits outside the nominal radius. */
+const FDOT_EDGE = FDOT_R + FDOT_SW / 2;              // 12.5
+const NOW_EDGE = NOW_RING_R + NOW_RING_SW / 2;       // 16.25 -- the white ring
+const LBL_GAP = 4;           // clear air between a dot's ink edge and its label
+/* Where a label's spoke starts, per dot. The current-position dot is wider by
+ * the whole ring, so it gets its own -- carried per job as `rOut`. */
+const R_OUT = FDOT_EDGE + LBL_GAP;                   // 16.5
+const R_OUT_NOW = NOW_EDGE + LBL_GAP;                // 20.25
+/* Candidate spokes as SCREEN BEARINGS in degrees (SVG y points DOWN, so a
+ * negative bearing points up-screen). Rightward set first, then the mirrored
+ * leftward set. The rendered tilt is the bearing folded into [-45,45] -- a
+ * leftward spoke draws at bearing-180 with an "end" anchor -- so rule 1 holds
+ * for every candidate by construction. Ordered flattest-first so ties in the
+ * scoring fall to the flatter, more readable angle. */
+const BEARINGS = [0, -15, 15, -30, 30, -45, 45, 180, 165, 195, 150, 210, 135, 225];
+/* DP costs, cheapest to dearest. These ARE the taste knobs -- tune on glass.
+ * DEV_W is charged per RUN (a run's angle is one stylistic choice), not per
+ * label, so a long run isn't taxed for existing. The ordering that matters:
+ * nudging a run's angle < opening a new run < leaving a singleton < dropping. */
+const LBL_DEV_W = 0.15;        // per degree a run's angle drifts off the ideal
+const LBL_RUN_COST = 40;       // opening a new run -- a visible break in the pattern
+const LBL_SINGLE_COST = 120;   // a run of ONE: the lone straggler, priced to hurt
+const LBL_DROP_COST = 1000;    // last resort
+/* Track inside a label's own `rOut` is ignored by the conflict test: every
+ * spoke starts beside its dot and the track runs straight through that dot, so
+ * without the exclusion the track would veto all 14 bearings for every label.
+ * Using rOut itself (rather than a separate constant) means the exclusion is
+ * exactly the disc the dot glyph already covers, and it widens automatically
+ * for the ringed current-position dot. Beyond it a track hit is a REAL
+ * conflict -- which is the "label lying along a horizontal track" case. */
+const bearingNorm = (deg) => ((deg % 360) + 360) % 360;
+const isLeftward = (deg) => { const d = bearingNorm(deg); return d > 90 && d < 270; };
+/* Bearing -> rendered text tilt, always within [-45,45]. */
+const bearingTilt = (deg) => {
+  const d = bearingNorm(deg);
+  return d > 90 && d < 270 ? d - 180 : d >= 270 ? d - 360 : d;
+};
+/* Shortest angular distance between two bearings, 0..180. A side flip is 180,
+ * which is what makes flipping sides dearer than nudging the angle. */
+const bearingDelta = (a, b) => Math.abs(bearingNorm(a - b + 180) - 180);
+/* The label's ORIENTED box: centre, unit axis along the text, half-extents.
+ * Oriented, not axis-aligned, and that distinction is load-bearing -- an AABB
+ * around a 45-degree label claims a huge square of mostly-empty space, which
+ * vetoed every angle for mid-track labels on a horizontal storm and made the
+ * solver drop them (caught in test, 2026-07-19). Conflicts are tested against
+ * THIS; the AABB below exists only to hand keep-outs to the region/city/scale
+ * engine, which is axis-aligned by design. */
+function labelRect(cx, cy, w, bearing, rOut) {
+  const r = bearing * Math.PI / 180, ux = Math.cos(r), uy = Math.sin(r);
+  const R = (rOut == null ? R_OUT : rOut) + w / 2;
+  return { mx: cx + ux * R, my: cy + uy * R, ux, uy, hw: w / 2 + 4, hh: LBL_H / 2 };
+}
+/* Point inside an oriented rect: rotate the offset into the rect's own frame. */
+function rectHasPt(R, x, y) {
+  const dx = x - R.mx, dy = y - R.my;
+  return Math.abs(dx * R.ux + dy * R.uy) <= R.hw && Math.abs(dy * R.ux - dx * R.uy) <= R.hh;
+}
+/* Oriented-rect overlap by separating axis: four candidate axes (both rects'
+ * own axes), disjoint if any one separates them. */
+function rectHit(A, B) {
+  const dx = B.mx - A.mx, dy = B.my - A.my;
+  const axes = [[A.ux, A.uy], [-A.uy, A.ux], [B.ux, B.uy], [-B.uy, B.ux]];
+  for (const [ax, ay] of axes) {
+    const ra = A.hw * Math.abs(A.ux * ax + A.uy * ay) + A.hh * Math.abs(A.ux * ay - A.uy * ax);
+    const rb = B.hw * Math.abs(B.ux * ax + B.uy * ay) + B.hh * Math.abs(B.ux * ay - B.uy * ax);
+    if (Math.abs(dx * ax + dy * ay) > ra + rb) return false;
+  }
+  return true;
+}
+/* An axis-aligned keep-out box as a rect, so it can go through rectHit. */
+const boxAsRect = (b) => ({ mx: (b.x1 + b.x2) / 2, my: (b.y1 + b.y2) / 2,
+                            ux: 1, uy: 0, hw: (b.x2 - b.x1) / 2, hh: (b.y2 - b.y1) / 2 });
+/* AABB enclosing the oriented label -- keep-out export only (see labelRect). */
+function labelBox(cx, cy, w, bearing, rOut) {
+  const R = labelRect(cx, cy, w, bearing, rOut);
+  const ex = R.hw * Math.abs(R.ux) + R.hh * Math.abs(R.uy);
+  const ey = R.hw * Math.abs(R.uy) + R.hh * Math.abs(R.ux);
+  return { x1: R.mx - ex, y1: R.my - ey, x2: R.mx + ex, y2: R.my + ey };
 }
 const boxHit = (a, b) => a.x1 < b.x2 && a.x2 > b.x1 && a.y1 < b.y2 && a.y2 > b.y1;
+const inBox = (x, y, b) => x >= b.x1 && x <= b.x2 && y >= b.y1 && y <= b.y2;
+/* Polyline -> points every ~`step` px. Sampling beats exact segment/box
+ * clipping for the track test: it is trivially correct, and the near-dot
+ * exclusion above falls out as a plain distance check per sample. */
+function samplePoly(pts, step) {
+  const out = [];
+  for (let i = 1; i < pts.length; i++) {
+    const ax = pts[i - 1][0], ay = pts[i - 1][1], bx = pts[i][0], by = pts[i][1];
+    const segs = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / step));
+    for (let s = 0; s < segs; s++) out.push([ax + (bx - ax) * s / segs, ay + (by - ay) * s / segs]);
+  }
+  if (pts.length) out.push(pts[pts.length - 1]);
+  return out;
+}
 function thinLabels(jobs) {
   if (jobs.length <= 2) return jobs.slice();
   const kept = [jobs[0]]; let lastKept = jobs[0];
@@ -483,25 +596,155 @@ function thinLabels(jobs) {
   kept.push(jobs[jobs.length - 1]);
   return kept;
 }
-function placeLabels(jobsIn) {
-  const jobs = thinLabels(jobsIn), placed = [];
-  for (const j of jobs) {
-    const w = (j.text ? j.text.length : 0) * CHAR_W;
-    const away = (j.tdy > 0) ? -1 : 1;
-    let chosen = 0;
-    if (placed.some((pb) => boxHit(labelBox(j.cx, j.cy, w, 0), pb))) {
-      let done = false;
-      for (const step of [15, 30, 45]) {
-        const deg = away * step;
-        if (!placed.some((pb) => boxHit(labelBox(j.cx, j.cy, w, deg), pb))) { chosen = deg; done = true; break; }
-      }
-      if (!done) chosen = away * 45;
-    }
-    j.deg = chosen;
-    j.anchor = Math.abs(chosen) > 90 ? "end" : "start";
-    placed.push(labelBox(j.cx, j.cy, w, chosen));
+/* Tag a job with everything the renderer needs for a given bearing. */
+function tagLabel(j, deg) {
+  const left = isLeftward(deg), r = j.rOut == null ? R_OUT : j.rOut;
+  j.bearing = deg;
+  j.tilt = bearingTilt(deg);
+  j.anchor = left ? "end" : "start";
+  j.tx = left ? -r : r;   // rotate() maps +x to the tilt, so a leftward spoke
+  return j;               // needs -x plus an "end" anchor to radiate outward
+}
+/* Public entry point: solve, but NEVER let a solver bug blank the map. The card
+ * is a storm-warning display; if the placement math throws, flat labels in the
+ * default spot beat no labels and beat a dead render. Dropping an individual
+ * tag that genuinely fits nowhere is expected and fine (Aaron, 2026-07-19) --
+ * this catch is for the different case where the solver itself breaks. */
+function placeLabels(jobsIn, env) {
+  try {
+    return solveLabels(jobsIn, env);
+  } catch (e) {
+    console.warn("hurricane-card: label solver failed, using flat fallback", e);
+    return thinLabels(jobsIn || []).map((j) => tagLabel(j, 0));
   }
-  return jobs;
+}
+/* Place the forecast-dot time labels. `env.boxes` are static keep-outs (the
+ * forecast dots themselves, the home marker); `env.trackPts` is the sampled
+ * track polyline. Returns only the labels that survived, each tagged with its
+ * bearing/tilt/anchor. See the block comment above labelRect for the rules. */
+function solveLabels(jobsIn, env) {
+  const jobs = thinLabels(jobsIn);
+  const n = jobs.length;
+  if (!n) return [];
+  const statics = (env && env.boxes) || [];
+  const tpts = (env && env.trackPts) || [];
+  const NB = BEARINGS.length;
+  const W = jobs.map((j) => (j.text ? j.text.length : 0) * CHAR_W);
+
+  // Geometry + STATIC feasibility per (label, bearing), computed once up front.
+  // A keep-out box containing the label's OWN dot centre is skipped -- that is
+  // its own dot, which every spoke necessarily starts next to.
+  const srect = statics.map(boxAsRect);
+  const box = [], ok = [];
+  for (let i = 0; i < n; i++) {
+    box[i] = []; ok[i] = [];
+    const jx = jobs[i].cx, jy = jobs[i].cy;
+    const jr = jobs[i].rOut == null ? R_OUT : jobs[i].rOut;
+    for (let k = 0; k < NB; k++) {
+      const R = labelRect(jx, jy, W[i], BEARINGS[k], jr);
+      box[i][k] = R;
+      let good = !srect.some((s, si) => !inBox(jx, jy, statics[si]) && rectHit(R, s));
+      if (good)
+        for (const t of tpts) {
+          if (Math.hypot(t[0] - jx, t[1] - jy) <= jr) continue;   // under its own dot
+          if (rectHasPt(R, t[0], t[1])) { good = false; break; }
+        }
+      ok[i][k] = good;
+    }
+  }
+
+  // ---- Pass A: the IDEAL bearing. Score each candidate by how many labels fit
+  // if the whole track used it. The objective is deliberately "fewest exceptions
+  // needed", not "fewest raw collisions" -- the winner is the angle the runs get
+  // built around, so it should be the one that needs the least breaking.
+  let ideal = BEARINGS[0], bestScore = -Infinity;
+  for (let k = 0; k < NB; k++) {
+    const seen = []; let fit = 0;
+    for (let i = 0; i < n; i++) {
+      if (!ok[i][k] || seen.some((b) => rectHit(box[i][k], b))) continue;
+      seen.push(box[i][k]); fit++;
+    }
+    // Ties: flatter text wins, then the up-screen spoke (negative y is up).
+    const sc = fit * 1000 - Math.abs(bearingTilt(BEARINGS[k])) * 2 - Math.sin(BEARINGS[k] * Math.PI / 180) * 3;
+    if (sc > bestScore) { bestScore = sc; ideal = BEARINGS[k]; }
+  }
+
+  // ---- Pass B: DP over contiguous RUNS. State is (bearing of the last PLACED
+  // label, is that run still a singleton, index of that label). A dropped label
+  // is transparent -- it does not break the run around it. The singleton
+  // penalty is charged when a one-label run closes, and that is the whole
+  // mechanism behind "neighbours come along": carrying 6,7,8 over to a new angle
+  // buys one run cost, while breaking for 5 alone buys a run cost AND a
+  // singleton penalty, so the DP takes the group whenever the group fits.
+  const key = (k, s, li) => k + "|" + s + "|" + li;
+  let cur = new Map();
+  cur.set(key(-1, 1, -1), { cost: 0, back: null, k: -1, s: 1, li: -1 });
+  for (let i = 0; i < n; i++) {
+    const next = new Map();
+    const relax = (kk, ss, li, cost, back, act) => {
+      const kx = key(kk, ss, li), prev = next.get(kx);
+      if (!prev || cost < prev.cost) next.set(kx, { cost, back, k: kk, s: ss, li, act });
+    };
+    for (const st of cur.values()) {
+      // Drop label i: costly, but keeps the run structure intact across it.
+      relax(st.k, st.s, st.li, st.cost + LBL_DROP_COST, st, { i, drop: true });
+      for (let k = 0; k < NB; k++) {
+        if (!ok[i][k]) continue;
+        // Adjacency is exact here: st.li is the last label actually drawn, and
+        // labels are ordered along the track, so this is the only near neighbour.
+        if (st.li >= 0 && rectHit(box[i][k], box[st.li][st.k])) continue;
+        if (st.k === k) {
+          relax(k, 1, i, st.cost, st, { i, k });                     // extend the run
+        } else {
+          let c = st.cost + bearingDelta(BEARINGS[k], ideal) * LBL_DEV_W;
+          if (st.k >= 0) { c += LBL_RUN_COST; if (st.s === 0) c += LBL_SINGLE_COST; }
+          relax(k, 0, i, c, st, { i, k });                           // open a new run
+        }
+      }
+    }
+    cur = next;
+    // Unreachable in practice -- dropping is always a legal move, so some state
+    // always survives. Belt-and-braces: degrade to no labels, never to a throw.
+    if (!cur.size) return [];
+  }
+  // Close the final run.
+  let best = null;
+  for (const st of cur.values()) {
+    const c = st.cost + (st.s === 0 && st.k >= 0 ? LBL_SINGLE_COST : 0);
+    if (!best || c < best.c) best = { c, st };
+  }
+  if (!best) return [];
+
+  const chosen = new Array(n).fill(-1);
+  for (let st = best.st; st && st.act; st = st.back)
+    if (!st.act.drop) chosen[st.act.i] = st.act.k;
+
+  // ---- Pass C: non-adjacent safety sweep. The DP only tests each label against
+  // its immediate predecessor; a long 45-degree label can occasionally reach
+  // past it. Cheap belt-and-braces -- drop anything that still overlaps.
+  const out = [], kept = [];
+  for (let i = 0; i < n; i++) {
+    const k = chosen[i];
+    if (k < 0) continue;
+    if (kept.some((b) => rectHit(box[i][k], b))) continue;
+    kept.push(box[i][k]);
+    out.push(tagLabel(jobs[i], BEARINGS[k]));
+  }
+  return out;
+}
+
+/* Home's projected screen point. Longitude is normalized into the map's
+ * 360-degree window first, so a home more than half the globe away in raw
+ * longitude still projects to the correct side (the short way round) rather
+ * than the wrong edge. May land OFF-frame -- callers decide what to do then.
+ * Shared by the home marker and the label solver's keep-out, so the two can
+ * never disagree about where home is. */
+function homeScreenPt(st, proj) {
+  const cLng = (st.bbox[0] + st.bbox[2]) / 2;
+  let hlng = st.home[0];
+  while (hlng - cLng > 180) hlng -= 360;
+  while (hlng - cLng < -180) hlng += 360;
+  return proj(hlng, st.home[1]);
 }
 
 /* mdi-home as an SVG path, scaled + centered. */
@@ -898,40 +1141,57 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     const ink = (p.cat === "TD" || p.cat === "TS" || p.cat === "HU") ? "#EDE3D2" : "#14110d";
     // Inner elements anchor at the group origin (0,0); the group's translate puts
     // them at the dot. Same paint order as before: dot, then "now" ring, then glyph.
-    let inner = `<circle class="hu-fdot" cx="0" cy="0" r="12" fill="${catColor(p.cat)}"/>`;
-    if (i === 0) inner += `<circle class="hu-now-ring" cx="0" cy="0" r="15"/>`;   // current position (tau 0)
+    let inner = `<circle class="hu-fdot" cx="0" cy="0" r="${FDOT_R}" fill="${catColor(p.cat)}"/>`;
+    if (i === 0) inner += `<circle class="hu-now-ring" cx="0" cy="0" r="${NOW_RING_R}"/>`;   // current position (tau 0)
     inner += `<text class="hu-fcat" x="0" y="5" fill="${ink}">${esc(catDotLabel(p.cat))}</text>`;
     fdotGroups.push(zlFixed(x, y, inner));
-    keepOut.push(i === 0 ? { x1: x - 18, y1: y - 18, x2: x + 18, y2: y + 18 }
-                         : { x1: x - 15, y1: y - 15, x2: x + 15, y2: y + 15 });
+    // Keep-out is the dot's own reach: the current-position dot is wider by its
+    // whole white ring, so it claims more room than the plain forecast dots.
+    const kr = (i === 0 ? R_OUT_NOW : R_OUT) - 1;
+    keepOut.push({ x1: x - kr, y1: y - kr, x2: x + kr, y2: y + kr });
     if (p.label) {
       const a = projPts[i - 1] || [x, y], b = projPts[i + 1] || [x, y];
-      labelJobs.push({ cx: x, cy: y, text: p.label, tdx: b[0] - a[0], tdy: b[1] - a[1] });
+      labelJobs.push({ cx: x, cy: y, text: p.label, tdx: b[0] - a[0], tdy: b[1] - a[1],
+                       rOut: i === 0 ? R_OUT_NOW : R_OUT });
     }
   });
-  placeLabels(labelJobs).forEach((L) => {
-    // Label anchors at its dot origin (0,0); rotation about the origin is
-    // translation-invariant, so placeLabels' spoke `deg` still applies verbatim.
-    const rot = L.deg ? ` transform="rotate(${L.deg.toFixed(1)},0,0)"` : "";
-    const inner = `<text class="hu-flabel" x="16" y="5" text-anchor="${L.anchor}"${rot}>${esc(L.text)}</text>`;
+  // Conflict targets for the label solver. keepOut already holds every forecast
+  // dot box (pushed just above); an ON-FRAME home marker joins them -- an
+  // off-frame home is edge-clamped furniture that _fitOverlays owns, and it
+  // never sits where a label would. SNAPSHOT (slice): keepOut keeps growing
+  // below as labels are placed, and the solver must see only what exists now.
+  const labelBlockers = keepOut.slice();
+  if (cfg.show_home !== false && st.home && st.home[0] != null) {
+    const [hx0, hy0] = homeScreenPt(st, proj);
+    if (hx0 >= 0 && hx0 <= VBW && hy0 >= 0 && hy0 <= VBH)
+      labelBlockers.push({ x1: hx0 - 20, y1: hy0 - 20, x2: hx0 + 20, y2: hy0 + 20 });
+  }
+  // Track polylines, sampled, so a label can be tested for lying ALONG the
+  // track rather than merely crossing a dot. Past + forecast both count: a
+  // label laid over either one is unreadable.
+  const trackPts = [];
+  for (const seg of [st.fcstTrack, st.pastTrack])
+    if (seg && seg.length > 1) trackPts.push(...samplePoly(projectPart(proj, seg), 5));
+  placeLabels(labelJobs, { boxes: labelBlockers, trackPts }).forEach((L) => {
+    // Spoke label: the text starts R_OUT from the dot and radiates outward, so
+    // it reads as pointing back at its dot. Rotation about the group origin is
+    // translation-invariant, so the bearing's tilt applies verbatim here. A
+    // leftward spoke draws at x=-R_OUT with an "end" anchor (see placeLabels).
+    // y=5 is baseline centring for the 17px face, same as the dot glyph.
+    const rot = L.tilt ? ` transform="rotate(${L.tilt.toFixed(1)},0,0)"` : "";
+    const inner = `<text class="hu-flabel" x="${L.tx.toFixed(2)}" y="5" text-anchor="${L.anchor}"${rot}>${esc(L.text)}</text>`;
     flabelGroups.push(zlFixed(L.cx, L.cy, inner));
-    const w = (L.text ? L.text.length : 0) * CHAR_W;
-    keepOut.push(labelBox(L.cx, L.cy, w, L.deg));
+    keepOut.push(labelBox(L.cx, L.cy, (L.text ? L.text.length : 0) * CHAR_W, L.bearing, L.rOut));
   });
   storm.push(...fdotGroups, ...flabelGroups);
 
   const homeParts = [];
   let farCase = false, hcx = 0, hcy = 0, homeAnch = "";
   if (cfg.show_home !== false && st.home && st.home[0] != null) {
-    // Normalize home longitude into the map's 360-degree window so a home more than
-    // half the globe away in raw longitude still projects to the correct side (short
-    // way round), not the wrong edge. Then project it like everything else -- the
-    // marker sits where home actually is on THIS map, and the chevron aims at it.
-    const cLng = (st.bbox[0] + st.bbox[2]) / 2;
-    let hlng = st.home[0];
-    while (hlng - cLng > 180) hlng -= 360;
-    while (hlng - cLng < -180) hlng += 360;
-    const [hx, hy] = proj(hlng, st.home[1]);
+    // Home projects like everything else -- the marker sits where home actually
+    // is on THIS map, and the chevron aims at it. See homeScreenPt for the
+    // longitude normalization.
+    const [hx, hy] = homeScreenPt(st, proj);
     if (hx >= 0 && hx <= VBW && hy >= 0 && hy <= VBH) {
       homeParts.push(houseGlyph(hx, hy));
       keepScreen.push({ x1: hx - 20, y1: hy - 20, x2: hx + 20, y2: hy + 20 });
