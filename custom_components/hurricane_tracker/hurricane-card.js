@@ -81,7 +81,7 @@ const OPTIONAL_LAYERS = [
  * storms and fall back to their left/default state. */
 const TRI_GROUPS = [
   { key: "wind",   title: "Wind field",     lLabel: "Current",    rLabel: "Swath",      def: "left", master: "show_winds" },
-  { key: "stripe", title: "Coastal stripe", lLabel: "Warning",    rLabel: "Surge",      def: "left", nhcOnly: true },
+  { key: "stripe", title: "Coastal hazard",  lLabel: "Wind",       rLabel: "Surge",      def: "left", nhcOnly: true },
 ];
 function triState(prefs, key) {
   const g = TRI_GROUPS.find((t) => t.key === key);
@@ -279,6 +279,18 @@ const catColor = (c) => CAT_COLOR[c] || CAT_COLOR.TS;
 /* NHC watch/warning coastal-segment identity colors, keyed by TCWW code. */
 const WW_COLOR = { TWA: "#FFE14D", TWR: "#3B7DDB", HWA: "#FF6FB0", HWR: "#E03030" };
 const wwColor = (t) => WW_COLOR[(t || "").toUpperCase()] || null;
+/* Plain names for the legend. These are WATCH/WARNING products, NOT "advisories"
+ * -- an Advisory is a lower NWS tier, and calling a Hurricane Warning one would
+ * understate it. ("Advisory" in this card means the numbered NHC bulletin.)
+ * The four codes are all WIND-threshold products (34 kt TS force / 64 kt
+ * hurricane force), which is why the stripe slider's left side reads "Wind"
+ * against "Surge". */
+const WW_LABEL = {
+  TWA: "Tropical Storm Watch", TWR: "Tropical Storm Warning",
+  HWA: "Hurricane Watch", HWR: "Hurricane Warning",
+};
+/* Legend order: warnings above watches, hurricane above tropical storm. */
+const WW_ORDER = ["HWR", "HWA", "TWR", "TWA"];
 
 /* Wind-band identity colors, GDACS-style: green 34kt / orange 50kt / red 64kt,
  * drawn nested (34 widest/bottom -> 64 core/top). Fixed hexes like the cat ramp. */
@@ -417,8 +429,11 @@ const ptsStr = (proj, coords) =>
 
 /* ---- coastline smoothing: Catmull-Rom -> cubic bezier path ----------------
  * Turns the (budget-thinned) basemap points into smooth curves so coastlines
- * read as detailed rather than faceted. Basemap layers only — never the cone,
- * tracks, or watch/warning segments, which are official geometry. */
+ * read as detailed rather than faceted. Basemap-derived geometry only — never
+ * the cone or tracks, which are official NHC geometry. Watch/warning segments
+ * are smoothed ONLY when server-side coast tracing succeeded (seg.traced): at
+ * that point they ARE basemap coastline, sliced from geo.coast, and must curve
+ * with it. An untraced W/W segment is NHC's own breakpoint line — left straight. */
 function smoothPath(pts, closed) {
   const n = pts.length;
   if (n < 2) return "";
@@ -825,11 +840,17 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     });
 
   const storm = [];
+  // Watch/warning stripe. `traced` segments were re-cut server-side from the
+  // SAME vertices as geo.coast, so they must go through the SAME smoother --
+  // drawn straight against a curve-smoothed coast, the stripe visibly peels off
+  // the shoreline on every bend. Untraced segments are NHC's raw breakpoint
+  // chords (the snap-failure fallback) and stay straight: official geometry
+  // isn't ours to curve.
   if (triStripe === "left")
     for (const seg of st.ww || []) {
       const col = wwColor(seg.type);
       if (col && seg.coords && seg.coords.length >= 2)
-        storm.push(`<polyline class="hu-ww" points="${ptsStr(proj, seg.coords)}" stroke="${col}"/>`);
+        storm.push(`<path class="hu-ww" d="${basePath(proj, seg.coords, false, smooth && seg.traced === true)}" stroke="${col}"/>`);
     }
   if (st.cone && st.cone.length >= 3)
     storm.push(`<polygon class="hu-cone-poly" points="${ptsStr(proj, st.cone)}"/>`);
@@ -1003,9 +1024,26 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
         rows.push([lay.surge.loading ? "Loading storm surge…"
           : lay.surge.failed ? "Storm surge data unavailable"
           : "No current storm surge data", null]);
-    } else if (triStripe === "left" && nhcStorm
-        && !(st.ww || []).some((seg) => wwColor(seg.type) && seg.coords && seg.coords.length >= 2)) {
-      rows.push(["No coastal warnings in effect", null]);
+    } else if (triStripe === "left" && nhcStorm) {
+      // Name what's actually in effect: the stripe's four colors carry the whole
+      // difference between "get ready" and "this is happening", and an unlabeled
+      // colored line can't communicate that. Rows appear ONLY when something is
+      // active (Aaron's call) -- otherwise the honest "none in effect" note.
+      // DEDUPED BY TYPE: since coast-tracing, one warning emits several segments
+      // (the mainland run plus each fronting barrier island), so iterating
+      // segments naively would stack five identical rows.
+      const active = [];
+      for (const seg of st.ww || []) {
+        if (!wwColor(seg.type) || !seg.coords || seg.coords.length < 2) continue;
+        const k = String(seg.type).toUpperCase();
+        if (!active.includes(k)) active.push(k);
+      }
+      if (active.length) {
+        active.sort((a, b) => WW_ORDER.indexOf(a) - WW_ORDER.indexOf(b));
+        for (const k of active) rows.push([WW_LABEL[k] || k, WW_COLOR[k]]);
+      } else {
+        rows.push(["No coastal warnings in effect", null]);
+      }
     }
     // Wind note STACKS below the stripe/surge rows in the same box — the
     // corner slot is one stacked legend; notes never fight for it. Neutral
@@ -1531,7 +1569,7 @@ const STYLE = `
   .hu-scale-label { font: 600 11px/1 sans-serif; fill: var(--secondary-text-color); opacity: .7;
                     paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
   .hu-wind { fill-opacity: .42; stroke: none; }
-  .hu-ww { fill: none; stroke-width: 4; stroke-linecap: round; }
+  .hu-ww { fill: none; stroke-width: 2; stroke-linecap: round; }
   .hu-surge { fill-opacity: .5; stroke: none; }
   .hu-popdot { fill: #4FC3F7; stroke: rgba(0,0,0,.35); stroke-width: .5; }
   .hu-slegend-sw { stroke: rgba(0,0,0,.3); stroke-width: .5; }

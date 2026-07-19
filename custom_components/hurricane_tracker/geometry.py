@@ -24,6 +24,9 @@ from .const import (
     POP_GRID_MIN_POP,
     POP_GRID_START_DIV,
     UNIT_KM,
+    WW_ISLAND_DIST_DEG,
+    WW_SNAP_TOL_DEG,
+    WW_TRACE_MAX_PTS,
     ZOOM_BUFFER_FACTOR,
     ZOOM_MAX_SCALE,
     ZOOM_PAYLOAD_CAP_BYTES,
@@ -340,6 +343,209 @@ def clip_basemap(basemap, bbox, pad, ref_span=None, budget=None, cap_bytes=None)
             }
 
     return geo
+
+
+# ---------------------------------------------------------------------------
+# Watch/warning coast tracing
+# ---------------------------------------------------------------------------
+# NHC ships watches/warnings as a BREAKPOINT list (_ww_wwlin): named coastal
+# reference points joined by straight chords. Drawn raw, a Panhandle warning is
+# 7 vertices and the stripe cuts straight across Apalachee Bay. There is no
+# higher-resolution vector W/W product anywhere in the NHC services, so the fix
+# is local: snap the breakpoints onto OUR coast and draw the coast between them.
+#
+# This runs on the POST-clip, POST-simplify arrays (the exact ones shipped in
+# geo["coast"]), not the full basemap. That is the whole trick -- the stripe is
+# literally a slice of the drawn coastline's own vertices, so it can never drift
+# out of register with it, and the card's smoother treats both identically.
+def _nearest_on_part(part, bx, by):
+    """(distance, vertex index) of the closest vertex of `part` to (bx, by).
+    Longitude is cos-lat corrected so the metric is locally isotropic; nearest
+    VERTEX (not nearest point-on-segment) is enough because the coast is already
+    DP-simplified to roughly screen resolution."""
+    k = math.cos(math.radians(by))
+    best_d2, best_i = float("inf"), -1
+    for i, (x, y) in enumerate(part):
+        dx = (x - bx) * k
+        dy = y - by
+        d2 = dx * dx + dy * dy
+        if d2 < best_d2:
+            best_d2, best_i = d2, i
+    return math.sqrt(best_d2), best_i
+
+
+def _walk_part(part, a, b):
+    """Vertices of `part` from index a to b inclusive. On a CLOSED ring (an
+    island) the two indices have two paths between them, so take the shorter
+    one -- otherwise a warning on an island's south shore can wrap the long way
+    round the north. On an open polyline it's a plain directional slice."""
+    n = len(part)
+    if n > 2 and part[0] == part[-1]:
+        m = n - 1                       # final vertex repeats the first
+        fwd = (b - a) % m
+        bwd = (a - b) % m
+        if bwd < fwd:
+            return [part[(a - t) % m] for t in range(bwd + 1)]
+        return [part[(a + t) % m] for t in range(fwd + 1)]
+    step = 1 if b >= a else -1
+    return [part[i] for i in range(a, b + step, step)]
+
+
+def _pt_seg_dist(p, a, b):
+    """Point to line-SEGMENT distance in degrees, cos-lat corrected."""
+    k = math.cos(math.radians(p[1]))
+    px, py = (p[0] - a[0]) * k, p[1] - a[1]
+    bx, by = (b[0] - a[0]) * k, b[1] - a[1]
+    dd = bx * bx + by * by
+    if dd == 0:
+        return math.hypot(px, py)
+    t = (px * bx + py * by) / dd
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    return math.hypot(px - t * bx, py - t * by)
+
+
+def _dist_to_runs(p, runs):
+    best = float("inf")
+    for r in runs:
+        for i in range(len(r) - 1):
+            d = _pt_seg_dist(p, r[i], r[i + 1])
+            if d < best:
+                best = d
+    return best
+
+
+def _island_runs(coast, runs, used, dist):
+    """Stretches of OTHER coast parts running within `dist` of the traced runs --
+    the barrier islands fronting the warned mainland, which a real coastal
+    warning covers but a single-part trace misses entirely.
+
+    Only the CONTIGUOUS vertices actually within `dist` are kept, so a long
+    island that merely grazes the warned stretch contributes just the near part
+    and doesn't spill past the warning's ends. Parts are bbox-rejected against
+    the runs' expanded extent first: without that this is O(all coast points x
+    run length) on every bake, which is real work on a Pi."""
+    if not runs or dist <= 0:
+        return []
+    xs = [p[0] for r in runs for p in r]
+    ys = [p[1] for r in runs for p in r]
+    mnx, mxx = min(xs) - dist, max(xs) + dist
+    mny, mxy = min(ys) - dist, max(ys) + dist
+    out = []
+    for pi, part in enumerate(coast):
+        if pi in used:
+            continue
+        px = [p[0] for p in part]
+        py = [p[1] for p in part]
+        if max(px) < mnx or min(px) > mxx or max(py) < mny or min(py) > mxy:
+            continue
+        cur = []
+        for p in part:
+            if _dist_to_runs(p, runs) <= dist:
+                cur.append(p)
+            else:
+                if len(cur) >= 2:
+                    out.append(cur)
+                cur = []
+        if len(cur) >= 2:
+            out.append(cur)
+    return out
+
+
+def _trace_one(pts, coast, tol):
+    """Trace one W/W segment onto the coast. Returns (runs, used_part_indices),
+    or (None, None) to signal "fall back to NHC's raw chords".
+
+    Two-pass snap. Pass 1 takes each breakpoint's globally nearest coast vertex.
+    That alone is NOT sufficient: measured live on AL02, breakpoints repeatedly
+    snap onto tiny 4-point barrier-island fragments instead of the 766-point
+    mainland, which shatters one continuous warning into four. At Cape San Blas
+    the island fragment is 8x closer than the mainland, so a nearest-wins or
+    ratio-based continuity bias cannot fix it either. So pass 2 picks the
+    DOMINANT part (most breakpoints, ties to the longer part) and re-snaps every
+    breakpoint that is still within `tol` of it. Breakpoints genuinely far from
+    the dominant part keep their own part and become a real break -- which is
+    what correctly splits a Keys-plus-mainland warning."""
+    snaps = []
+    for (bx, by) in pts:
+        best = (float("inf"), -1, -1)
+        for pi, part in enumerate(coast):
+            d, vi = _nearest_on_part(part, bx, by)
+            if d < best[0]:
+                best = (d, pi, vi)
+        snaps.append(best)
+    if min(s[0] for s in snaps) > tol:
+        return None, None               # nothing near any coast in view
+
+    counts = {}
+    for (_d, pi, _vi) in snaps:
+        counts[pi] = counts.get(pi, 0) + 1
+    dom = max(counts, key=lambda p: (counts[p], len(coast[p])))
+
+    anchors = []
+    for i, (bx, by) in enumerate(pts):
+        d, vi = _nearest_on_part(coast[dom], bx, by)
+        if d <= tol:
+            anchors.append((dom, vi))
+        elif snaps[i][0] <= tol:
+            anchors.append((snaps[i][1], snaps[i][2]))
+        else:
+            anchors.append(None)        # unsnappable -> forces a break here
+
+    runs, cur = [], []
+    for i in range(len(anchors) - 1):
+        a, b = anchors[i], anchors[i + 1]
+        if a is None or b is None or a[0] != b[0]:
+            if len(cur) >= 2:
+                runs.append(cur)
+            cur = []
+            continue
+        walk = _walk_part(coast[a[0]], a[1], b[1])
+        if not walk:
+            continue
+        if not cur:
+            cur = list(walk)
+        else:
+            cur.extend(walk[1:] if cur[-1] == walk[0] else walk)
+    if len(cur) >= 2:
+        runs.append(cur)
+    if not runs:
+        return None, None
+
+    used = {a[0] for a in anchors if a is not None}
+    out = []
+    for r in runs:
+        if len(r) > WW_TRACE_MAX_PTS:
+            r = _dp([tuple(p) for p in r], 0.002)
+        if len(r) < 2:
+            continue
+        out.append([[round(x, 4), round(y, 4)] for x, y in r])
+    return (out or None), used
+
+
+def trace_ww_on_coast(ww, coast, tol=WW_SNAP_TOL_DEG,
+                      island_dist=WW_ISLAND_DIST_DEG):
+    """Replace each W/W segment's straight breakpoint chords with the coastline
+    between them, plus the barrier islands fronting that stretch. Segments that
+    trace carry traced=True (the card smooths those, matching the coast);
+    segments that don't pass through untouched and stay straight, because
+    unsnapped they're still official NHC geometry."""
+    if not ww or not coast:
+        return ww or []
+    out = []
+    for seg in ww:
+        pts = seg.get("coords") or []
+        runs, used = (_trace_one(pts, coast, tol) if len(pts) >= 2
+                      else (None, None))
+        if not runs:
+            out.append(dict(seg))
+            continue
+        kind = seg.get("type", "")
+        for run in runs:
+            out.append({"type": kind, "coords": run, "traced": True})
+        for isl in _island_runs(coast, runs, used, island_dist):
+            out.append({"type": kind, "traced": True,
+                        "coords": [[round(x, 4), round(y, 4)] for x, y in isl]})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +952,12 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
                        budget=ZOOM_POINT_BUDGET,
                        cap_bytes=ZOOM_PAYLOAD_CAP_BYTES)
 
+    # Watch/warning stripe, re-drawn along OUR coast. Must run AFTER the clip:
+    # it slices the very arrays in `geo["coast"]` the card draws, which is what
+    # guarantees the stripe sits exactly on the drawn coastline instead of near
+    # it. Falls back per-segment to NHC's raw chords if nothing snaps.
+    ww_traced = trace_ww_on_coast(fdata.get("ww") or [], geo["coast"])
+
     # Region labels whose anchor falls anywhere in the BUFFERED viewBox (E6: the
     # card's zoom-aware label engine re-places labels at the current view, so
     # panning into the buffer must have anchors to reveal; the card filters to
@@ -949,7 +1161,7 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
         "fcstTrack": fcst,
         "pastTrack": past,
         "points": points,
-        "ww": fdata.get("ww") or [],
+        "ww": ww_traced,
         "windField": built_current,
         "windSwath": built_swath,
         "geo": geo,

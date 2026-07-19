@@ -168,6 +168,38 @@ SURGE_POLY_LAYER = 2
 SURGE_ENVELOPE_DEG = 12.0     # +/- degrees around the current position (spatial filter)
 SURGE_OFFSET_DEG = 0.005      # server-side generalization (maxAllowableOffset, degrees)
 SURGE_POINT_BUDGET = 6000     # client-side DP cap across all returned rings
+# --- watch/warning coast tracing --------------------------------------------
+# NHC's _ww_wwlin is a BREAKPOINT list, not a coastline: the whole Florida
+# Panhandle TWA arrives as 7 vertices joined by straight chords, so the drawn
+# stripe cuts across every bay (measured live on AL02 adv 1A, 2026-07-19).
+# geometry.trace_ww_on_coast snaps those breakpoints onto the ALREADY-CLIPPED,
+# ALREADY-SIMPLIFIED coast arrays and re-emits the stripe as a slice of the same
+# vertices the card draws as coastline -- so it registers exactly, at any zoom,
+# and picks up the card's Catmull-Rom smoothing for free.
+#
+# WW_SNAP_TOL_DEG: max breakpoint->coast distance (degrees, cos-lat corrected)
+# that still counts as a snap. Live AL02 worst case was 0.0945 deg (~6.5 mi) on
+# the simplified coast, so 0.25 (~17 mi) clears real data with room while
+# staying well under the gap that must still SPLIT a stripe (e.g. the Keys vs
+# the mainland, ~50+ mi) into separate runs. Any segment whose breakpoints all
+# miss by more than this falls back to NHC's raw chords -- never nothing.
+WW_SNAP_TOL_DEG = 0.25
+# Hard ceiling on a single traced run's vertex count. The source coast is
+# already DP-budgeted, so this only ever fires on a pathological frame; over it,
+# the run is re-simplified rather than shipped whole.
+WW_TRACE_MAX_PTS = 2000
+# Barrier islands. The stripe traces ONE coast part (the mainland), but a real
+# coastal warning covers the barrier islands fronting it -- Santa Rosa, St.
+# George, St. Vincent -- which are separate parts in the basemap and would
+# otherwise sit unstroked right where the warning is loudest. So after the
+# mainland trace, any OTHER coast part running within this distance of it gets
+# stroked too, clipped to the stretch that's actually close (which is what keeps
+# a long island from spilling past the warning's ends).
+# Measured on AL02 (2026-07-19): the four fronting islands sit 0.1-3.7 mi off
+# the traced run, and the next-nearest part is 32.4 mi away. 10 mi sits in the
+# middle of that gap, so the choice is not delicate on this storm.
+WW_ISLAND_DIST_DEG = 0.145   # ~10 mi
+
 # --- past-track trail -------------------------------------------------------
 # Miles of TRAVEL kept behind the storm, so a fast and a slow storm trail the
 # same physical length on screen (consistent zoom).
