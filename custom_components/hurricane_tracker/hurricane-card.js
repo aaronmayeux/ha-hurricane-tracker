@@ -260,6 +260,13 @@ function fmtClock(refTime, tau) {
 }
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+/* Pass 3: paren-safe wrapping for the data-bar text in the narrow side column.
+ * Wrapping is at spaces only -- never mid-word -- and a parenthesized group
+ * like "(per NHC)" is a nowrap span: it may drop to its own line but never
+ * splits inside. The chunks between separators stay breakable on purpose --
+ * making each data-bar chunk an unbreakable unit forces the column wide
+ * (rejected). Escape FIRST, then wrap: the regex only ever sees escaped text. */
+const escNoWrapParens = (s) => esc(s).replace(/\([^()]*\)/g, (m) => `<span class="hu-nw">${m}</span>`);
 
 /* Failed-source codes -> plain names for the failure notes. The coordinator
  * sends ["NHC"], ["GDACS"], both, or ["storm feed"] as a generic fallback. */
@@ -283,17 +290,30 @@ function fmtLocal(ms) {
   return d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " + t;
 }
 
-/* ---- projection: lng/lat -> SVG px through the storm bbox ----------------- */
+/* ---- projection: lng/lat -> SVG px through the storm bbox -----------------
+ * Web-Mercator-style: x is linear in longitude, y runs through the Mercator
+ * latitude stretch, so land SHAPES read correctly at every latitude in view.
+ * The old plate carree froze its E-W compression at the storm's mid-latitude
+ * (fine inside a storm-sized frame, but a frame spanning 25 degrees of
+ * latitude plus the fill-mode buffer reveal drew far latitudes visibly
+ * stretched -- a storm-framed US looked horizontally smeared; Aaron,
+ * 2026-07-18). Mercator is conformal, so wind rings stay round and the
+ * mileage scale's px-per-mile at mid-latitude holds for both axes. Latitude
+ * clamps to +/-85 (Mercator pole blow-up; storms never get near it). */
 function makeProject(bbox) {
   const [minLng, minLat, maxLng, maxLat] = bbox;
-  const midLat = (minLat + maxLat) / 2;
-  const cosf = Math.max(0.2, Math.cos(midLat * Math.PI / 180));
-  const wLng = Math.max((maxLng - minLng) * cosf, 1e-6);
-  const hLat = Math.max((maxLat - minLat), 1e-6);
-  const s = Math.min(VBW / wLng, VBH / hLat);
-  const ox = (VBW - wLng * s) / 2;
-  const oy = (VBH - hLat * s) / 2;
-  return (lng, lat) => [ox + (lng - minLng) * cosf * s, oy + (maxLat - lat) * s];
+  const mY = (lat) => {
+    const p = Math.max(-85, Math.min(85, lat)) * Math.PI / 180;
+    return Math.log(Math.tan(Math.PI / 4 + p / 2));
+  };
+  const x0 = minLng * Math.PI / 180;
+  const w = Math.max((maxLng - minLng) * Math.PI / 180, 1e-9);
+  const y1 = mY(maxLat);
+  const h = Math.max(y1 - mY(minLat), 1e-9);
+  const s = Math.min(VBW / w, VBH / h);
+  const ox = (VBW - w * s) / 2;
+  const oy = (VBH - h * s) / 2;
+  return (lng, lat) => [ox + (lng * Math.PI / 180 - x0) * s, oy + (y1 - mY(lat)) * s];
 }
 const projectPart = (proj, coords) => coords.map(([lng, lat]) => proj(lng, lat));
 const ptsStr = (proj, coords) =>
@@ -535,24 +555,32 @@ function scaleAxes(bbox, proj, geo, keepOut, conePx, hcx, hcy) {
     const box = { x1: x - 18, y1: y - 10, x2: x + 18, y2: y + 10 };
     return keepOut.some((b) => boxHit(box, b));
   };
-  const out = [];
+  const xout = [], yout = [];
   const sx = left ? 1 : -1, sy = bottom ? -1 : 1;
   for (let k = 1; ; k++) {
     const x = axisX + sx * stepPx * k;
     if (x < 34 || x > VBW - 34) break;
     if (blocked(x, axisY)) continue;
-    out.push(`<line class="hu-scale-tick" x1="${x.toFixed(1)}" y1="${axisY.toFixed(1)}" x2="${x.toFixed(1)}" y2="${(axisY + (bottom ? -7 : 7)).toFixed(1)}"/>`);
+    xout.push(`<line class="hu-scale-tick" x1="${x.toFixed(1)}" y1="${axisY.toFixed(1)}" x2="${x.toFixed(1)}" y2="${(axisY + (bottom ? -7 : 7)).toFixed(1)}"/>`);
     const txt = k === 1 ? withCommas(step) + " mi" : withCommas(step * k);
-    out.push(`<text class="hu-scale-label" x="${x.toFixed(1)}" y="${(axisY + (bottom ? -10 : 17)).toFixed(1)}" text-anchor="middle">${esc(txt)}</text>`);
+    xout.push(`<text class="hu-scale-label" x="${x.toFixed(1)}" y="${(axisY + (bottom ? -10 : 17)).toFixed(1)}" text-anchor="middle">${esc(txt)}</text>`);
   }
   for (let k = 1; ; k++) {
     const y = axisY + sy * stepPx * k;
     if (y < 34 || y > VBH - 34) break;
     if (blocked(axisX, y)) continue;
-    out.push(`<line class="hu-scale-tick" x1="${axisX.toFixed(1)}" y1="${y.toFixed(1)}" x2="${(axisX + (left ? 7 : -7)).toFixed(1)}" y2="${y.toFixed(1)}"/>`);
-    out.push(`<text class="hu-scale-label" x="${(axisX + (left ? 11 : -11)).toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="${left ? "start" : "end"}">${esc(withCommas(step * k))}</text>`);
+    yout.push(`<line class="hu-scale-tick" x1="${axisX.toFixed(1)}" y1="${y.toFixed(1)}" x2="${(axisX + (left ? 7 : -7)).toFixed(1)}" y2="${y.toFixed(1)}"/>`);
+    yout.push(`<text class="hu-scale-label" x="${(axisX + (left ? 11 : -11)).toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="${left ? "start" : "end"}">${esc(withCommas(step * k))}</text>`);
   }
-  return out;
+  // Wrap per axis with its visible-edge anchor: the tick row along the bottom/
+  // top edge shifts vertically, the column along the left/right edge shifts
+  // horizontally. Tick spacing is untouched -- a translate can't change
+  // pxPerMile -- only which edge the axis hugs.
+  const wrapA = (a, parts) => `<g class="hu-anch" data-anch="${a}">${parts.join("")}</g>`;
+  const res = [];
+  if (xout.length) res.push(wrapA(bottom ? "b" : "t", xout));
+  if (yout.length) res.push(wrapA(left ? "l" : "r", yout));
+  return res;
 }
 
 /* ---- build the SVG from one baked storm payload --------------------------- */
@@ -761,7 +789,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   storm.push(...fdotGroups, ...flabelGroups);
 
   const homeParts = [];
-  let farCase = false, hcx = 0, hcy = 0;
+  let farCase = false, hcx = 0, hcy = 0, homeAnch = "";
   if (cfg.show_home !== false && st.home && st.home[0] != null) {
     // Normalize home longitude into the map's 360-degree window so a home more than
     // half the globe away in raw longitude still projects to the correct side (short
@@ -788,6 +816,10 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
       if (hcx > TK_X1 && hcy < TK_Y2) {
         if (hx > VBW) hcy = TK_Y2 + 8; else hcx = TK_X1 - 8;
       }
+      // Anchor only on the axes where the marker is actually edge-clamped, so
+      // _fitOverlays slides it to the visible edge it hugs -- never the axis
+      // where it sits at home's true projected position.
+      homeAnch = (hx < 0 ? "l" : hx > VBW ? "r" : "") + (hy < 0 ? "t" : hy > VBH ? "b" : "");
       homeParts.push(homeEdgeMarker(hx, hy, st.meta || {}, hcx, hcy));
       // keep-out AABB covering the whole marker (house + chevron + distance label)
       // so region labels and the scale avoid it -- collision rules apply to it too.
@@ -829,32 +861,52 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
 
   // E5 surge legend: bottom-right screen-space furniture (hu-overlays; hides on
   // zoom like the model legend). Band labels with their fill swatches; loading/
-  // failure states named honestly -- never a silently missing layer.
+  // failure states named honestly -- never a silently missing layer. The same
+  // slot carries the stripe-left counterpart: an NHC storm with zero drawable
+  // ww segments says so explicitly -- "none in effect" is a real fact, distinct
+  // from unavailable (GDACS storms never show this; the panel gates them as
+  // NHC-only and their stripe falls back silently by design).
   const slegend = [];
-  if (triStripe === "right" && lay.surge
-      && (lay.surge.loading || lay.surge.failed || (lay.surge.bands && lay.surge.bands.length))) {
-    const seen = new Set(), rows = [];
-    if (lay.surge.bands)
-      lay.surge.bands.forEach((b, i) => {
-        const lbl = b.label || "Surge area";
-        if (seen.has(lbl) || rows.length >= 5) return;
-        seen.add(lbl);
-        rows.push([lbl, surgeColor(b, i)]);
+  {
+    const rows = [];
+    if (triStripe === "right" && lay.surge
+        && (lay.surge.loading || lay.surge.failed || (lay.surge.bands && lay.surge.bands.length))) {
+      const seen = new Set();
+      if (lay.surge.bands)
+        lay.surge.bands.forEach((b, i) => {
+          const lbl = b.label || "Surge area";
+          if (seen.has(lbl) || rows.length >= 5) return;
+          seen.add(lbl);
+          rows.push([lbl, surgeColor(b, i)]);
+        });
+      if (!rows.length)
+        rows.push([lay.surge.loading ? "Loading storm surge…" : "Storm surge unavailable", null]);
+    } else if (triStripe === "left" && nhcStorm
+        && !(st.ww || []).some((seg) => wwColor(seg.type) && seg.coords && seg.coords.length >= 2)) {
+      rows.push(["No coastal warnings in effect", null]);
+    }
+    if (rows.length) {
+      // Swatchless notes ("Storm surge unavailable", "No coastal warnings in
+      // effect") are right-justified: no 18px swatch slot in the box, text
+      // anchored END at the box's right padding edge -- so the label hugs the
+      // corner even though the box width is only a char-count estimate.
+      const hasSw = rows.some((r) => r[1]);
+      const rowH = 19, padX = 8, padY = 6;
+      const maxCh = Math.max(...rows.map((r) => r[0].length));
+      const w = padX + (hasSw ? 18 : 0) + maxCh * 8.4 + padX;
+      const h = rows.length * rowH + padY * 2;
+      const x0 = VBW - 12 - w, y0 = VBH - 12 - h;
+      slegend.push(`<rect class="hu-mlegend-bg${hasSw ? "" : " hu-note-bg"}" x="${x0.toFixed(0)}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
+      rows.forEach(([label, col], i) => {
+        const cy = y0 + padY + i * rowH + rowH / 2;
+        if (col) slegend.push(`<rect class="hu-slegend-sw" x="${(x0 + padX).toFixed(1)}" y="${(cy - 5).toFixed(1)}" width="10" height="10" rx="2" fill="${col}"/>`);
+        if (hasSw)
+          slegend.push(`<text class="hu-mlegend-t" x="${(x0 + padX + (col ? 16 : 0)).toFixed(1)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
+        else
+          slegend.push(`<text class="hu-mlegend-t hu-note-t" text-anchor="end" x="${(x0 + w - padX).toFixed(1)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
       });
-    if (!rows.length)
-      rows.push([lay.surge.loading ? "Loading storm surge…" : "Storm surge unavailable", null]);
-    const rowH = 19, padX = 8, padY = 6;
-    const maxCh = Math.max(...rows.map((r) => r[0].length));
-    const w = padX + 18 + maxCh * 8.4 + padX;
-    const h = rows.length * rowH + padY * 2;
-    const x0 = VBW - 12 - w, y0 = VBH - 12 - h;
-    slegend.push(`<rect class="hu-mlegend-bg" x="${x0.toFixed(0)}" y="${y0}" width="${w.toFixed(0)}" height="${h}" rx="6"/>`);
-    rows.forEach(([label, col], i) => {
-      const cy = y0 + padY + i * rowH + rowH / 2;
-      if (col) slegend.push(`<rect class="hu-slegend-sw" x="${(x0 + padX).toFixed(1)}" y="${(cy - 5).toFixed(1)}" width="10" height="10" rx="2" fill="${col}"/>`);
-      slegend.push(`<text class="hu-mlegend-t" x="${(x0 + padX + (col ? 16 : 0)).toFixed(1)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
-    });
-    keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+      keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+    }
   }
 
   // E5 population impact: sum the mapped-place population inside the forecast
@@ -907,9 +959,27 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   const panGroup = [...base, ...windLayer, ...surgeLayer, ...gridDots,
     `<g class="hu-zl-cities">${zl0.cities}</g>`, ...storm,
     `<g class="hu-zl-regions">${zl0.regions}</g>`];
-  const overlayGroup = [...scale, ...homeParts, ...mlegend, ...slegend];
+  // Screen-space furniture re-anchors to the VISIBLE edges (._fitOverlays):
+  // a cluster carries data-anch letters (l/r/t/b) and slides by the letterbox
+  // slack, so legends and the mileage axes hug the real card edges in fill
+  // mode instead of floating at the frame's (Aaron, 2026-07-18). scaleAxes
+  // wraps its own two per-axis groups; the in-frame home glyph gets no anchor.
+  const anchG = (a, parts) => (a && parts.length)
+    ? [`<g class="hu-anch" data-anch="${a}">${parts.join("")}</g>`] : parts;
+  const overlayGroup = [...scale, ...anchG(homeAnch, homeParts), ...anchG("bl", mlegend), ...anchG("br", slegend)];
   const vb = st.viewBox ? st.viewBox.join(" ") : "";
   const ms = st.maxScale != null ? st.maxScale : 1;
+  // NO frame clip on the geographic layer: in fill mode (Pass 3) the
+  // element's letterbox slack past the 800x600 frame shows the BUFFERED
+  // basemap, so the map fills the card instead of floating as a bar-boxed 4:3
+  // window (a hard frame clip was tried 2026-07-18 and read as "the map
+  // narrowed" -- rejected). Projection honesty: at the DEFAULT view the slack
+  // reveals (mostly) the storm's own latitude band, where the storm-local
+  // projection's E-W scale is still right, so no visible stretch; far-latitude
+  // geography (a horizontally smeared US) only enters when the user zooms
+  // out/pans -- Session C behavior, their choice. True arbitrary-aspect
+  // reprojection stays deferred (spec 12). Screen furniture re-anchors to the
+  // visible edges via the data-anch groups + _fitOverlays.
   const svg = `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
     + ` data-viewbox="${vb}" data-maxscale="${ms}" data-bbox="${(st.bbox || []).join(" ")}" xmlns="http://www.w3.org/2000/svg">`
     + `<g class="hu-pan">${panGroup.join("")}</g>`
@@ -968,9 +1038,17 @@ function dataBar(st, lay, popImpact) {
   // only mapped places (>= 5k, GeoNames) are summed.
   if (popImpact != null && popImpact > 0)
     bits.push(`~${fmtPop(popImpact)} people in the cone (mapped cities)`);
+  // Keep batches together when there's room (Aaron): each bit is a .hu-chunk.
+  // Bottom bar: chunks flow inline with the dot separators -- exactly the old
+  // look. Side column: CSS stacks each chunk as its own line and hides the
+  // separators, so a bit only wraps INSIDE itself when it's genuinely longer
+  // than the column (still space-only, paren-safe wrapping -- chunks are NOT
+  // unbreakable units; that forces the column wide and stays rejected).
+  const bitsHtml = bits.map((b) => `<span class="hu-chunk">${escNoWrapParens(b)}</span>`)
+    .join(`<span class="hu-sep"> · </span>`);
   let peak = "";
   if (m.peak && m.peak.word) peak = `<div class="hu-bar-peak">Peak ${esc(m.peak.word)}${m.peak.label ? " by " + esc(m.peak.label) : ""}</div>`;
-  return `<div class="hu-bar-name">${esc(name)}</div><div class="hu-bar-data">${esc(bits.join(" \u00b7 "))}</div>${peak}`;
+  return `<div class="hu-bar-name">${escNoWrapParens(name)}</div><div class="hu-bar-data">${bitsHtml}</div>${peak}`;
 }
 
 /* Phase 4: the at-home wind timeline -- a compact, self-contained graph UNDER the
@@ -980,7 +1058,7 @@ function dataBar(st, lay, popImpact) {
  * distance tagged above it; and day/time labels INLINE at the real wind start/stop
  * points (weekday shown only when it changes, thinned to avoid collision, ends
  * always kept). Returns "" (renders nothing) unless home is forecast into a field. */
-function exposureTimeline(st, cfg) {
+function exposureTimeline(st, cfg, vertical) {
   if (cfg.show_timeline === false) return "";
   const ex = st.meta && st.meta.exposure;
   if (!ex || !ex.rows || !ex.rows.length) return "";        // hidden when no data
@@ -999,6 +1077,69 @@ function exposureTimeline(st, cfg) {
   if (hi - lo < 0.5) hi = lo + 0.5;
   const pct = (t) => ((Math.max(lo, Math.min(hi, t)) - lo) / (hi - lo)) * 100;
   const anchor = (x) => (x < 12 ? "translateX(0)" : x > 88 ? "translateX(-100%)" : "translateX(-50%)");
+
+  // Pass 3 side-column variant: a GENUINELY vertical render -- track top-to-
+  // bottom, "now" at top, future downward; time labels as normal horizontal
+  // text beside the track; the home glyph rides the track by vertical
+  // position. Not a CSS rotation -- rotated text was rejected outright.
+  if (vertical) {
+    const H = 190;   // track px height (fixed; the side column scrolls if tight)
+    let vbars = "";
+    for (const r of ex.rows) for (const [a, b] of r.windows) {
+      const t = pct(a), h = Math.max(1, pct(b) - t);
+      vbars += `<span class="hu-tlv-win" style="top:${t.toFixed(2)}%;height:${h.toFixed(2)}%;opacity:${OP[r.kt] || 0.16}"></span>`;
+    }
+    let vhome = "";
+    if (cpa)
+      vhome = `<span class="hu-tlv-home" style="top:${pct(cpa.tau).toFixed(2)}%"><svg viewBox="0 0 24 24"><path d="${MDI_HOME_PATH}"/></svg></span>`;
+    // Label items down the axis: "now", each wind start/stop (weekday dropped
+    // when unchanged, same rule as the horizontal), plus the closest-pass
+    // distance as a priority item near the cpa position (clamped off the ends
+    // so it can't sit on top of an end label).
+    const vseen = {}, vlist = [];
+    for (const t of bounds) { const k = Math.round(t); if (!(k in vseen)) { vseen[k] = 1; vlist.push(t); } }
+    vlist.sort((a, b) => a - b);
+    let vday = null;
+    const vitems = [{ y: 0, label: "now", pri: true }];
+    for (const t of vlist) {
+      const full = ref != null ? fmtClock(ref, t) : `~${Math.round(t)}h`;
+      let label = full;
+      if (ref != null) {
+        const sp = full.indexOf(" ");
+        const day = sp > 0 ? full.slice(0, sp) : full;
+        if (day === vday) label = full.slice(sp + 1);
+        vday = day;
+      }
+      vitems.push({ y: pct(t), label });
+    }
+    if (vitems.length > 1) vitems[vitems.length - 1].pri = true;   // the far end always keeps
+    if (cpa && cpa.dist != null)
+      vitems.push({ y: Math.max(8, Math.min(92, pct(cpa.tau))), label: withCommas(cpa.dist) + " " + unit, pri: true, tag: true });
+    vitems.sort((a, b) => a.y - b.y);
+    // 1D thinning in px on the fixed track height: priority items keep, the
+    // rest need clearance from EVERY kept label.
+    const GAP = 15;
+    const yPx = (it) => it.y * H / 100;
+    const kept = vitems.filter((it) => it.pri);
+    for (const it of vitems) {
+      if (it.pri) continue;
+      if (kept.every((k2) => Math.abs(yPx(k2) - yPx(it)) >= GAP)) kept.push(it);
+    }
+    kept.sort((a, b) => a.y - b.y);
+    const vAnchor = (y) => (y < 7 ? "translateY(0)" : y > 93 ? "translateY(-100%)" : "translateY(-50%)");
+    let vlabs = "";
+    for (const it of kept) {
+      if (!it.tag) vlabs += `<span class="hu-tlv-tick" style="top:${it.y.toFixed(2)}%"></span>`;
+      vlabs += `<span class="${it.tag ? "hu-tlv-tag" : "hu-tlv-time"}" style="top:${it.y.toFixed(2)}%;transform:${vAnchor(it.y)}">${esc(it.label)}</span>`;
+    }
+    return `<div class="hu-tl hu-tlv">
+      <div class="hu-tl-title">Storm force winds at home / Closest to eye</div>
+      <div class="hu-tlv-body" style="height:${H}px">
+        <div class="hu-tlv-track">${vbars}${vhome}</div>
+        <div class="hu-tlv-labels">${vlabs}</div>
+      </div>
+    </div>`;
+  }
 
   // wind bar: stronger thresholds stacked on top -> darker where they overlap
   let bars = "";
@@ -1061,8 +1202,45 @@ function exposureTimeline(st, cfg) {
 }
 
 const STYLE = `
-  ha-card { padding: 0; overflow: hidden; }
-  .hu-wrap { display: flex; flex-direction: column; position: relative; }
+  :host { display: block; height: 100%; }
+  ha-card { padding: 0; overflow: hidden; height: 100%; box-sizing: border-box; }
+  /* Pass 3 dynamic layout. One grid, three modes, no config -- the card decides
+   * (ResizeObserver -> _layoutCheck):
+   *   normal   -- content-driven height, the pre-0.2.3 behavior (masonry/mobile).
+   *   hu-fill  -- the dashboard imposed a height (sections drag-resize, panel
+   *               view): the card fills it; the map keeps its 800x600 projection
+   *               and letterboxes via preserveAspectRatio, and the slack shows
+   *               more of the buffered basemap, so it reads as map -- not bars.
+   *   hu-side  -- fill + wide-and-short: the whole non-map stack (tag, bar,
+   *               timeline, pager, stale note) moves to a 240px right column.
+   * hu-side always rides WITH hu-fill, and its row template must win: keep the
+   * .hu-side rules AFTER the .hu-fill rules (equal specificity, later wins). */
+  .hu-wrap { display: grid; grid-template-columns: minmax(0, 1fr); position: relative; }
+  .hu-wrap.hu-fill { height: 100%; grid-template-rows: auto minmax(0, 1fr) auto; }
+  .hu-wrap.hu-fill .hu-conewrap { min-height: 0; }
+  .hu-wrap.hu-fill .hu-svg { height: 100%; }
+  .hu-wrap.hu-side { grid-template-columns: minmax(0, 1fr) 240px; grid-template-rows: auto minmax(0, 1fr); }
+  .hu-wrap.hu-side .hu-tag { grid-column: 2; grid-row: 1; }
+  .hu-wrap.hu-side .hu-conewrap { grid-column: 1; grid-row: 1 / span 2; }
+  .hu-wrap.hu-side .hu-stack { grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto;
+                               overscroll-behavior: contain; scrollbar-width: thin;
+                               scrollbar-color: var(--secondary-text-color) transparent;
+                               display: flex; flex-direction: column; }
+  .hu-wrap.hu-side .hu-stack > * { flex: none; }
+  /* Storm pager rides the BOTTOM of the side column (Aaron, 2026-07-18);
+   * margin-top:auto collapses to normal flow when content already fills. */
+  .hu-wrap.hu-side .hu-stack .hu-pager { margin-top: auto; padding-top: 10px; }
+  .hu-nw { white-space: nowrap; }
+  /* Side column: each info batch (.hu-chunk) is its own line and separators
+   * hide -- batches stay together when there's room and only wrap internally
+   * when longer than the column. Bottom bar: chunks flow inline, unchanged. */
+  .hu-wrap.hu-side .hu-tag .hu-sep, .hu-wrap.hu-side .hu-bar-data .hu-sep { display: none; }
+  .hu-wrap.hu-side .hu-tag .hu-chunk, .hu-wrap.hu-side .hu-bar-data .hu-chunk { display: block; }
+  .hu-wrap.hu-side .hu-bar-data .hu-sep + .hu-chunk { margin-top: 3px; }
+  /* Side column: slimmer, BALANCED side padding (Aaron: split it evenly --
+   * flush-left with all the slack on the right read lopsided). */
+  .hu-wrap.hu-side .hu-tag, .hu-wrap.hu-side .hu-bar, .hu-wrap.hu-side .hu-tl,
+  .hu-wrap.hu-side .hu-stale { padding-left: 8px; padding-right: 8px; }
   .hu-tag { font: 600 13px/1 var(--ha-card-header-font-family, inherit); letter-spacing: .08em;
             text-transform: uppercase; color: var(--secondary-text-color); padding: 12px 14px 8px; }
   .hu-conewrap { position: relative; width: 100%; background: var(--hu-bg, var(--primary-background-color)); }
@@ -1090,9 +1268,17 @@ const STYLE = `
   .hu-toolbtn ha-icon { --mdc-icon-size: 16px; }
   .hu-panel { position: absolute; top: 44px; right: 10px; z-index: 3; display: none; width: 232px;
               max-width: calc(100% - 20px); box-sizing: border-box; container-type: inline-size;
+              max-height: calc(100% - 54px); overflow-y: auto; overscroll-behavior: contain;
+              scrollbar-width: thin; scrollbar-color: var(--secondary-text-color) transparent;
               background: var(--card-background-color, var(--primary-background-color)); color: var(--primary-text-color);
               border-radius: 16px; padding: 12px 14px 10px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
   .hu-panel.hu-open { display: block; }
+  /* Visible scroll thumb (Safari path; Chrome/Firefox use the standard props
+   * above). Content is NEVER shrunk to fit -- it scrolls instead. */
+  .hu-panel::-webkit-scrollbar, .hu-adv-body::-webkit-scrollbar, .hu-stack::-webkit-scrollbar { width: 8px; }
+  .hu-panel::-webkit-scrollbar-track, .hu-adv-body::-webkit-scrollbar-track, .hu-stack::-webkit-scrollbar-track { background: transparent; }
+  .hu-panel::-webkit-scrollbar-thumb, .hu-adv-body::-webkit-scrollbar-thumb, .hu-stack::-webkit-scrollbar-thumb {
+    background: var(--secondary-text-color); border-radius: 4px; }
   .hu-panel-row.hu-na { opacity: .45; }
   .hu-panel-note { font: 400 10px/1.2 sans-serif; opacity: .7; margin-left: 4px; }
   .hu-panel-group { font: 700 10.5px/1 sans-serif; letter-spacing: .08em; text-transform: uppercase;
@@ -1136,7 +1322,8 @@ const STYLE = `
                  padding: 12px 14px 8px; font: 700 14px/1.2 sans-serif; color: var(--primary-text-color); }
   .hu-adv-close { border: none; background: var(--secondary-background-color); color: var(--primary-text-color);
                   border-radius: 50%; width: 26px; height: 26px; cursor: pointer; font-size: 13px; flex: none; }
-  .hu-adv-body { overflow-y: auto; padding: 0 14px 14px; }
+  .hu-adv-body { overflow-y: auto; padding: 0 14px 14px; overscroll-behavior: contain;
+                 scrollbar-width: thin; scrollbar-color: var(--secondary-text-color) transparent; }
   .hu-adv-text { white-space: pre-wrap; overflow-wrap: break-word; color: var(--primary-text-color);
                  font: 400 13px/1.45 ui-monospace, Menlo, Consolas, monospace; }
   .hu-adv-wait { display: flex; justify-content: center; padding: 30px 0; }
@@ -1188,6 +1375,20 @@ const STYLE = `
   .hu-tl-tick { position: absolute; top: 0; width: 1px; height: 5px; transform: translateX(-50%);
                 background: var(--secondary-text-color); opacity: .5; }
   .hu-tl-time { position: absolute; top: 7px; white-space: nowrap; font: 400 11px/1 sans-serif; color: var(--secondary-text-color); }
+  /* Vertical timeline (side column): a real vertical track with horizontal
+   * text beside it -- never rotated text. */
+  .hu-tlv-body { display: flex; gap: 9px; }
+  .hu-tlv-track { position: relative; flex: none; width: 16px; height: 100%; border-radius: 3px;
+                  background: var(--divider-color, rgba(127,127,127,.2)); }
+  .hu-tlv-win { position: absolute; left: 0; width: 100%; border-radius: 3px; background: var(--primary-text-color); }
+  .hu-tlv-home { position: absolute; left: 50%; width: 18px; height: 18px; transform: translate(-50%, -50%); }
+  .hu-tlv-home svg { width: 100%; height: 100%; display: block; }
+  .hu-tlv-home path { fill: #fff; stroke: rgba(0,0,0,.55); stroke-width: 1.5; paint-order: stroke; }
+  .hu-tlv-labels { position: relative; flex: 1 1 auto; min-width: 0; }
+  .hu-tlv-tick { position: absolute; left: -7px; width: 5px; height: 1px;
+                 background: var(--secondary-text-color); opacity: .5; }
+  .hu-tlv-time { position: absolute; left: 3px; white-space: nowrap; font: 400 11px/1 sans-serif; color: var(--secondary-text-color); }
+  .hu-tlv-tag { position: absolute; left: 3px; white-space: nowrap; font: 600 11px/1 sans-serif; color: var(--secondary-text-color); }
   .hu-msg { padding: 28px 18px; text-align: center; color: var(--secondary-text-color); }
   .hu-msg .hu-msg-icon { --mdc-icon-size: 40px; color: var(--secondary-text-color); opacity: .7; }
   .hu-msg .hu-msg-icon.hu-spin { animation: hu-spin 1.4s linear infinite; transform-origin: center; }
@@ -1211,10 +1412,26 @@ class HurricaneCard extends HTMLElement {
     this._layerPrefs = loadLayerPrefs(); this._panelOpen = false;
     this._advOpen = false; this._advTitle = ""; this._advBody = ""; this._layerCache = {};
     this._layerBusy = {};   // in-flight layer fetches, keyed like _layerCache
+    // Pass 3 dynamic layout: fill-height + auto bar placement, decided from
+    // measurements only (no config). _stackHb caches the bottom-mode height of
+    // the non-map stack so the side-vs-bottom comparison stays feedback-free
+    // while side mode is active (you can't measure bottom-mode heights there).
+    this._fillMode = false; this._layoutMode = "bottom"; this._stackHb = null;
+    this._layoutRaf = 0; this._inLayout = false;
+    this._deferT = 0; this._deferN = 0;   // zero-rect retry (see _deferLayout)
   }
 
   setConfig(config) { this._config = config || {}; if (this.shadowRoot) this._render(); }
   getCardSize() { return 6; }
+  /* Sections-grid sizing (HA 2024.11+), from the documented cell metrics: a
+   * row is 56px + 8px gap, a section is 12 columns (~400px wide standard). Our
+   * bottom-mode content at full section width is tag (~33px) + 4:3 map
+   * (~300px) + info stack (~150px) ~ 480px, so rows: 8 (504px) reproduces the
+   * classic content-driven look out of the box; users drag-resize from there
+   * and fill-height tracks whatever they set. min_columns 6 (~200px): the map
+   * is unusable narrower. min_rows 4 (248px): can't be crushed to a sliver.
+   * Masonry ignores this and uses getCardSize. */
+  getGridOptions() { return { columns: 12, rows: 8, min_columns: 6, min_rows: 4 }; }
   static getStubConfig() { return {}; }
   static getConfigElement() { return document.createElement("hurricane-card-editor"); }
 
@@ -1227,6 +1444,17 @@ class HurricaneCard extends HTMLElement {
   connectedCallback() {
     if (this._hass && !this._data) { this._render(); this._fetch(); }
     if (!this._timer) this._timer = setInterval(() => this._fetch(), REFRESH_MS);
+    // Pass 3: one ResizeObserver drives the whole dynamic layout. Fill-height
+    // latches only until detach: a fresh attach (moving the card between
+    // views/dashboards recreates or reattaches it) re-detects from scratch.
+    this._fillMode = false; this._layoutMode = "bottom";
+    if (!this._ro) {
+      this._ro = new ResizeObserver(() => {
+        if (this._layoutRaf) return;   // rAF-debounce the resize storm of a drag
+        this._layoutRaf = requestAnimationFrame(() => { this._layoutRaf = 0; this._layoutCheck(); });
+      });
+      this._ro.observe(this);
+    }
     // A tap/click anywhere OUTSIDE the open layers panel closes it. Capture
     // phase + composedPath so taps on other cards or dashboard chrome count;
     // taps on the panel itself or the gear button pass through untouched.
@@ -1244,6 +1472,9 @@ class HurricaneCard extends HTMLElement {
   }
   disconnectedCallback() {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._ro) { this._ro.disconnect(); this._ro = null; }
+    if (this._layoutRaf) { cancelAnimationFrame(this._layoutRaf); this._layoutRaf = 0; }
+    if (this._deferT) { clearTimeout(this._deferT); this._deferT = 0; }
     if (this._docClose) { document.removeEventListener("click", this._docClose, true); this._docClose = null; }
     if (this._prefsUnsub) { this._prefsUnsub(); this._prefsUnsub = null; }
     this._prefsSubStarted = false;
@@ -1442,7 +1673,10 @@ class HurricaneCard extends HTMLElement {
           <span class="hu-page">${this._idx + 1} / ${storms.length}</span>
           <button data-nav="1" aria-label="Next storm">\u203a</button></div>`;
       }
-      const tagName = cfg.title != null ? cfg.title : `${(st.meta && st.meta.type) || "Storm"} \u00b7 ${(st.meta && st.meta.basinName) || ""}`;
+      // Title chunks ride the same keep-together rule as the data bar: the
+      // side column stacks type / basin as whole lines (separator hidden).
+      const tagHtml = cfg.title != null ? esc(cfg.title)
+        : `<span class="hu-chunk">${esc((st.meta && st.meta.type) || "Storm")}</span><span class="hu-sep"> \u00b7 </span><span class="hu-chunk">${esc((st.meta && st.meta.basinName) || "")}</span>`;
       const prefs = this._layerPrefs || {};
       // E4 model tracks: resolve this storm's layer state for the draw --
       // cached list, cached failure, or kick an on-demand fetch (loading).
@@ -1512,9 +1746,13 @@ class HurricaneCard extends HTMLElement {
           <div class="hu-adv-head"><span>${esc(this._advTitle || "Advisory")}</span>
           <button class="hu-adv-close" aria-label="Close">&#x2715;</button></div>
           <div class="hu-adv-body">${this._advBody || ""}</div></div>` : "";
-      body = `<div class="hu-tag">${esc(tagName)}</div>
+      // Pass 3: the whole non-map stack lives in ONE .hu-stack wrapper so the
+      // dynamic layout can move it below the map (default) or into the right
+      // side column purely via grid classes -- no DOM surgery. The advisory
+      // overlay stays outside (absolute over the whole card).
+      body = `<div class="hu-tag">${tagHtml}</div>
         <div class="hu-conewrap">${svg}${tools}</div>
-        <div class="hu-bar">${dataBar(st, lay, popImpact)}</div>${exposureTimeline(st, cfg)}${pager}${stale}${adv}`;
+        <div class="hu-stack"><div class="hu-bar">${dataBar(st, lay, popImpact)}</div>${exposureTimeline(st, cfg, this._layoutMode === "side")}${pager}${stale}</div>${adv}`;
     } else if (d.reason === "none_matched") {
       const n = d.activeAnywhere || 0;
       body = this._msg("mdi:map-marker-off", "No storms near you",
@@ -1544,7 +1782,10 @@ class HurricaneCard extends HTMLElement {
     }
 
     this.style.display = "";
-    this.shadowRoot.innerHTML = `<style>${STYLE}</style><ha-card><div class="hu-wrap" style="${this._styleVars()}">${body}</div></ha-card>`;
+    // Pass 3: emit the current layout-mode classes inline so a background
+    // re-render paints straight into the active layout (no one-frame snap).
+    const wrapCls = "hu-wrap" + (this._fillMode ? " hu-fill" : "") + (this._layoutMode === "side" ? " hu-side" : "");
+    this.shadowRoot.innerHTML = `<style>${STYLE}</style><ha-card><div class="${wrapCls}" style="${this._styleVars()}">${body}</div></ha-card>`;
     this.shadowRoot.querySelectorAll("[data-nav]").forEach((b) =>
       b.addEventListener("click", () => {
         const n = Number(b.getAttribute("data-nav"));
@@ -1592,11 +1833,141 @@ class HurricaneCard extends HTMLElement {
     const closeBtn = this.shadowRoot.querySelector(".hu-adv-close");
     closeBtn && closeBtn.addEventListener("click", () => { this._advOpen = false; this._render(); });
 
+    // Swatchless note fixup ("No coastal warnings in effect" / "Storm surge
+    // unavailable"): the backing rect's width at build time is only a char-count
+    // estimate. Once the text has actually PAINTED (rAF, not synchronously --
+    // measuring right after innerHTML can catch pre-layout/pre-font metrics and
+    // size the box wrong), fit the rect to the text's real bbox + padding. Re-run
+    // once web fonts finish loading (font swap changes the metrics). A zero/NaN
+    // measurement (e.g. hidden tab) leaves the estimated box alone.
+    {
+      const fit = () => {
+        const nt = this.shadowRoot && this.shadowRoot.querySelector("text.hu-note-t");
+        const nb = this.shadowRoot && this.shadowRoot.querySelector("rect.hu-note-bg");
+        if (!nt || !nb) return;
+        try {
+          const bx = nt.getBBox();
+          if (!bx || !(bx.width > 0)) return;
+          const padX = 8;
+          nb.setAttribute("x", (bx.x - padX).toFixed(1));
+          nb.setAttribute("width", (bx.width + padX * 2).toFixed(1));
+        } catch (_) {}
+      };
+      requestAnimationFrame(fit);
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fit());
+    }
+
     // Rebuild attaches a fresh gesture layer. Whether it starts at the default
     // frame or restores the user's zoom/pan is decided in _setupPanZoom: a storm
     // switch or a storm-identity change resets; a background poll of the SAME storm
     // preserves the view so it doesn't snap out from under the user mid-read.
     this._setupPanZoom();
+    // Pass 3: re-derive the dynamic layout for the fresh DOM. Runs AFTER the
+    // gesture layer on purpose: a mode flip re-renders, and that inner render
+    // replaces this DOM wholesale (listeners and all) -- so there are never
+    // two gesture layers wired to one svg.
+    this._layoutCheck();
+  }
+
+  /* ---- Pass 3: dynamic layout (fill-height + auto bar placement) ------------
+   * No config, no settings -- measurements decide.
+   * FILL: the dashboard imposed a height when the host's box stops tracking the
+   * content's natural height (sections drag-resize, panel view, the default
+   * getGridOptions rows). Detected by comparing host vs wrap height in normal
+   * flow; once seen, fill latches until the element re-attaches (a fresh attach
+   * re-detects from scratch -- see connectedCallback).
+   * SIDE: chosen over bottom only when it yields the BIGGER drawn map (the meet
+   * scale of the 800x600 frame), with 8% hysteresis so drag-resize in the
+   * sections editor doesn't flip-flop at the threshold, and a 700px width floor.
+   * Two states only: below (default) or right column. No left, no top. */
+  _layoutCheck() {
+    if (this._inLayout) return;   // the flip re-render re-enters; state is already final
+    const wrap = this.shadowRoot && this.shadowRoot.querySelector(".hu-wrap");
+    const cone = wrap && wrap.querySelector(".hu-conewrap");
+    if (!wrap || !cone) return;   // message states keep the plain layout
+    const host = this.getBoundingClientRect();
+    if (!host.width || !host.height) return;   // hidden tab -> keep current mode
+    let fill = this._fillMode;
+    if (!fill) {
+      const wh = wrap.getBoundingClientRect().height;
+      if (!wh) { this._deferLayout(); return; }   // fresh shadow DOM, not laid out yet
+      fill = Math.abs(host.height - wh) > 8;
+    }
+    let side = false;
+    if (fill) {
+      const tagEl = wrap.querySelector(".hu-tag");
+      const stackEl = wrap.querySelector(".hu-stack");
+      let Sb;   // bottom-mode height of the non-map stack (tag + bar/timeline/...)
+      if (this._layoutMode !== "side") {
+        Sb = (tagEl ? tagEl.offsetHeight : 0) + (stackEl ? stackEl.offsetHeight : 0);
+        this._stackHb = Sb;
+      } else {
+        Sb = this._stackHb != null ? this._stackHb : 150;
+      }
+      const SIDE_W = 240;
+      const scaleB = Math.min(host.width / VBW, Math.max(0, host.height - Sb) / VBH);
+      const scaleS = host.width >= 700
+        ? Math.min((host.width - SIDE_W) / VBW, host.height / VBH) : 0;
+      side = this._layoutMode === "side";
+      if (side) { if (scaleB > scaleS * 1.08) side = false; }
+      else if (scaleS > scaleB * 1.08) side = true;
+    }
+    const mode = side ? "side" : "bottom";
+    const flip = mode !== this._layoutMode;
+    this._fillMode = fill; this._layoutMode = mode;
+    wrap.classList.toggle("hu-fill", fill);
+    wrap.classList.toggle("hu-side", side);
+    if (flip) {
+      // The timeline emits a different variant per mode -- rebuild the DOM.
+      this._inLayout = true;
+      try { this._render(); } finally { this._inLayout = false; }
+    }
+    this._fitOverlays();
+  }
+
+  /* Pass 3: anchor screen-space furniture (legends, mileage axes, the edge-
+   * clamped home marker) to the VISIBLE edges. In fill mode the 800x600 frame
+   * centers in a wider/taller element (letterbox), so furniture placed at
+   * frame edges floats mid-card. Each cluster carries data-anch letters
+   * (l/r/t/b); slide it by the letterbox slack in user units on its anchored
+   * axes. Normal mode: slack 0 -> a no-op transform. Idempotent, cheap, runs
+   * on every layout pass (the RO path included -- no DOM rebuild needed). */
+  _fitOverlays() {
+    const svg = this.shadowRoot && this.shadowRoot.querySelector(".hu-svg");
+    if (!svg) return;
+    const r = svg.getBoundingClientRect();
+    if (!r.width || !r.height) { this._deferLayout(); return; }   // not laid out yet -> retry deferred
+    this._deferN = 0;   // real measurement -> reset the retry budget
+    const s = Math.min(r.width / VBW, r.height / VBH) || 1;
+    const oxU = Math.max(0, r.width / s - VBW) / 2;
+    const oyU = Math.max(0, r.height / s - VBH) / 2;
+    svg.querySelectorAll("g.hu-anch").forEach((g) => {
+      const a = g.getAttribute("data-anch") || "";
+      const dx = a.includes("l") ? -oxU : a.includes("r") ? oxU : 0;
+      const dy = a.includes("t") ? -oyU : a.includes("b") ? oyU : 0;
+      g.setAttribute("transform", `translate(${dx.toFixed(1)} ${dy.toFixed(1)})`);
+    });
+  }
+
+  /* Freshly written shadow-DOM content can measure 0x0 in the SAME task as the
+   * innerHTML write -- proven live 2026-07-18: the post-render fit read a
+   * 0-rect svg and bailed, so the edge anchors never applied (the floating
+   * legend/mileage-axis bug); the first fill detection can hit the same hazard
+   * on the wrap. Retry after layout settles: rAF for visible tabs, plus a
+   * timeout fallback because rAF is throttled to never in hidden tabs.
+   * Idempotent, budget-capped (a hidden tab gives up; the next render or
+   * resize restarts the cycle naturally). */
+  _deferLayout() {
+    if (this._deferT) return;
+    this._deferN = (this._deferN || 0) + 1;
+    if (this._deferN > 10) return;
+    const go = () => {
+      if (!this._deferT) return;
+      clearTimeout(this._deferT); this._deferT = 0;
+      this._layoutCheck();
+    };
+    this._deferT = setTimeout(go, 50);
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(go);
   }
 
   /* ---- pan / zoom (Session C) -----------------------------------------------
@@ -1725,16 +2096,23 @@ class HurricaneCard extends HTMLElement {
     };
     const schedule = () => { if (!raf) raf = requestAnimationFrame(apply); };
 
-    // px per SVG user-unit (the SVG is width:100%, so this varies with card width)
-    const scaleFactor = () => {
+    // Meet geometry: in fill mode (Pass 3) the svg element can be taller or
+    // wider than the 800x600 frame's aspect; preserveAspectRatio "meet" centers
+    // the frame with letterbox slack on one axis. All pointer math converts
+    // through the REAL rendered scale + offsets so pan/zoom stays cursor-
+    // accurate in every mode. Normal mode (height:auto) degenerates to the old
+    // math exactly: offsets 0, s = width/VBW.
+    const geom = () => {
       const r = svg.getBoundingClientRect();
-      return r.width ? VBW / r.width : 1;   // client px -> user units
+      const s = Math.min(r.width / VBW, r.height / VBH) || 1;
+      return { r, s, ox: (r.width - VBW * s) / 2, oy: (r.height - VBH * s) / 2 };
     };
+    // px per SVG user-unit at the current rendered size
+    const scaleFactor = () => 1 / geom().s;   // client px -> user units
     // client coords -> SVG user coords (pre-transform frame)
     const toUser = (clientX, clientY) => {
-      const r = svg.getBoundingClientRect();
-      const f = scaleFactor();
-      return [(clientX - r.left) * f, (clientY - r.top) * f];
+      const g = geom();
+      return [(clientX - g.r.left - g.ox) / g.s, (clientY - g.r.top - g.oy) / g.s];
     };
     // Zoom about a fixed user-space point, holding that point under the cursor/pinch.
     // Scale is clamped to [minScale, maxScale] FIRST, then the translate is derived
@@ -1835,10 +2213,19 @@ const EDITOR_FIELDS = [
 ];
 
 class HurricaneCardEditor extends HTMLElement {
-  setConfig(config) { this._config = { ...config }; this._render(); }
+  // When the change originated HERE, HA echoes it straight back through
+  // setConfig -- rebuilding the DOM then would destroy the very input the user
+  // is on (the native color picker closes mid-drag, the title field drops focus
+  // per keystroke). Self-echoes update state only; render is skipped.
+  setConfig(config) {
+    this._config = { ...config };
+    if (this._selfEmit) { this._selfEmit = false; return; }
+    this._render();
+  }
   set hass(h) { this._hass = h; }
 
   _emit() {
+    this._selfEmit = true;
     this.dispatchEvent(new CustomEvent("config-changed", {
       detail: { config: this._config }, bubbles: true, composed: true,
     }));

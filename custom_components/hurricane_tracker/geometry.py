@@ -839,18 +839,36 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     # Falls back to the current-position blob when there's no swath. Cheap either way.
     built_swath = []
     for tier in (fdata.get("windSwath") or []):
-        ring = None
+        rings = []
         if tier.get("ring"):
             r = tier["ring"]
-            ring = _dp(r, 0.04) if len(r) > 40 else r
+            rings = [_dp(r, 0.04) if len(r) > 40 else r]
         elif tier.get("points"):
             # NHC tiers are pre-ordered by travel time (past -> current -> forecast);
             # GDACS tiers keep the nearest-neighbour ordering.
             seq = (tier["points"] if tier.get("ordered")
                    else _order_along_track(tier["points"], cur_lng, cur_lat))
             ring = _corridor_ring(seq)
-        if ring and len(ring) >= 3:
-            built_swath.append({"kt": tier["kt"], "rings": [ring]})
+            if ring:
+                rings.append(ring)
+                # Fold guard: at a sharp track turn the corridor's inside-edge
+                # perpendicular offsets cross, the outline self-intersects, and
+                # the card's nonzero fill cancels the fold into a notch (seen
+                # live on Elida's elbow, 2026-07-18). Union a geodesic circle at
+                # every swath point into the SAME tier (the classic sausage
+                # buffer): the card merges a tier's rings into one nonzero path,
+                # so the circles pave over any fold pocket and round the elbows
+                # -- and each is the TRUE wind extent at its center, so nothing
+                # overdraws. Payload cost is a few KB per storm.
+                for p in seq:
+                    rr = max(p.get("ne", 0), p.get("se", 0),
+                             p.get("sw", 0), p.get("nw", 0))
+                    if rr > 0:
+                        c = _circle_ring(p["lat"], p["lng"], rr)
+                        if c:
+                            rings.append(c)
+        if rings and len(rings[0]) >= 3:
+            built_swath.append({"kt": tier["kt"], "rings": rings})
     # Current field and full-track swath are BOTH emitted now (windField +
     # windSwath). The card picks which to draw per the `wind_swath` toggle
     # (default: current position). GDACS's swath already spans the whole track

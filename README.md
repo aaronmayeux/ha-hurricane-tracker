@@ -27,6 +27,13 @@ you automatically — no manual dashboard resource to add.
   GDACS basins don't publish these).
 - Map overlays: region/country labels, an off-screen home marker that points
   toward home when it's outside the frame, and a far-offshore mileage scale.
+- **Pan and zoom** — drag, pinch, or scroll to explore around the storm;
+  a Recenter button restores the default frame.
+- **Fits your dashboard automatically** — in a sections view the card
+  drag-resizes like any other and fills whatever size you give it (panel views
+  too). Wide, short cards move the storm info into a right-hand side column
+  with a vertical wind timeline — no configuration, the card decides from its
+  own shape.
 - Distance from your home, current intensity, movement, and peak forecast
   category.
 - Bundled offline global basemap built from Natural Earth and GeoNames (no map
@@ -147,7 +154,6 @@ so one draws at a time (left = default, middle = off, right = the alternate):
 | Layer | What it shows |
 |---|---|
 | Forecast model tracks | Guidance ("spaghetti") tracks from the NHC forecast models — NHC Official, consensus, GFS, HAFS-A, UKMET. Atlantic/East Pacific/Central Pacific storms only; other basins don't publish per-model tracks. |
-| Wind history trail | The 34 kt wind field as it stood at each past advisory — how the storm's wind field grew. Atlantic/East Pacific/Central Pacific storms only. |
 | Advisory text | The storm's full advisory / alert text in an overlay. |
 
 ### Colors and style (default = follow theme)
