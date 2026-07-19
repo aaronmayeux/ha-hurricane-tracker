@@ -1424,14 +1424,15 @@ class HurricaneCard extends HTMLElement {
   setConfig(config) { this._config = config || {}; if (this.shadowRoot) this._render(); }
   getCardSize() { return 6; }
   /* Sections-grid sizing (HA 2024.11+), from the documented cell metrics: a
-   * row is 56px + 8px gap, a section is 12 columns (~400px wide standard). Our
-   * bottom-mode content at full section width is tag (~33px) + 4:3 map
-   * (~300px) + info stack (~150px) ~ 480px, so rows: 8 (504px) reproduces the
-   * classic content-driven look out of the box; users drag-resize from there
-   * and fill-height tracks whatever they set. min_columns 6 (~200px): the map
-   * is unusable narrower. min_rows 4 (248px): can't be crushed to a sliver.
-   * Masonry ignores this and uses getCardSize. */
-  getGridOptions() { return { columns: 12, rows: 8, min_columns: 6, min_rows: 4 }; }
+   * row is 56px + 8px gap, a section is 12 columns (~400px wide standard).
+   * rows: 10 (632px) runs TALLER than the classic 4:3-map look (8 rows would
+   * reproduce it) on purpose: storm tracks mostly run north-south, so the
+   * extra height goes straight into cone/track visibility via the fill-mode
+   * letterbox reveal (Aaron, judged on glass 2026-07-18). Users drag-resize
+   * from there and fill-height tracks whatever they set. min_columns 6
+   * (~200px): the map is unusable narrower. min_rows 4 (248px): can't be
+   * crushed to a sliver. Masonry ignores this and uses getCardSize. */
+  getGridOptions() { return { columns: 12, rows: 10, min_columns: 6, min_rows: 4 }; }
   static getStubConfig() { return {}; }
   static getConfigElement() { return document.createElement("hurricane-card-editor"); }
 
