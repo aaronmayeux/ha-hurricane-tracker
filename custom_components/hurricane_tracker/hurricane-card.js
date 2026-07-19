@@ -1903,7 +1903,7 @@ class HurricaneCard extends HTMLElement {
     // Optional-layer platform (Session E): sticky toggles, panel/overlay open
     // state (kept on the instance so a background poll's re-render doesn't
     // close them under the user), and the per-(storm,advisory) session cache.
-    this._layerPrefs = loadLayerPrefs(); this._panelOpen = false;
+    this._layerPrefs = loadLayerPrefs(); this._panelOpen = false; this._panelScroll = 0;
     this._advOpen = false; this._advTitle = ""; this._advBody = ""; this._layerCache = {};
     this._layerBusy = {};   // in-flight layer fetches, keyed like _layerCache
     // Layout POSITION prefs (v0.2.6 Phase 2): per-device, own store, never
@@ -2417,7 +2417,37 @@ class HurricaneCard extends HTMLElement {
     const wrapCls = "hu-wrap" + (this._fillMode ? " hu-fill" : "")
       + (this._sideOn ? " hu-side" : "")
       + (this._present.pager ? " hu-haspager" : "");
+    // The gear panel is a SCROLL container, and every toggle inside it triggers a
+    // full re-render -- the innerHTML swap below destroys the element, so its
+    // scrollTop reset to 0 and yanked the user back to the top mid-change (Aaron,
+    // 2026-07-19). Carry the offset across the rebuild. Reading it HERE, in
+    // _render, rather than in the individual toggle handlers is deliberate: every
+    // path that rebuilds the DOM goes through this one line, so no handler can be
+    // added later that forgets to do it. The `else` clears the memory whenever a
+    // render happens with the panel shut, which likewise catches EVERY close path
+    // (gear click, outside click, storm switch) without touching any of them --
+    // so re-opening the gear always starts at the top, as expected.
+    if (this._panelOpen) {
+      const pOld = this.shadowRoot.querySelector(".hu-panel");
+      if (pOld) this._panelScroll = pOld.scrollTop;
+    } else this._panelScroll = 0;
     this.shadowRoot.innerHTML = `<style>${STYLE}</style><ha-card><div class="${wrapCls}" style="${this._styleVars()}">${body}</div></ha-card>`;
+    // Put the panel back where it was. Synchronous first -- the new DOM is parsed
+    // by now, so this usually lands. Then re-asserted once on the next frame: the
+    // browser CLAMPS scrollTop to the scrollHeight it knows at assignment time,
+    // and late layout (ha-icon upgrading, fonts settling) can grow the panel after
+    // this tick, which would silently leave the restore short.
+    if (this._panelOpen && this._panelScroll > 0) {
+      const want = this._panelScroll;
+      const pNew = this.shadowRoot.querySelector(".hu-panel");
+      if (pNew) {
+        pNew.scrollTop = want;
+        requestAnimationFrame(() => {
+          const p2 = this.shadowRoot && this.shadowRoot.querySelector(".hu-panel");
+          if (p2 && this._panelOpen && Math.abs(p2.scrollTop - want) > 1) p2.scrollTop = want;
+        });
+      }
+    }
     this.shadowRoot.querySelectorAll("[data-nav]").forEach((b) =>
       b.addEventListener("click", () => {
         const n = Number(b.getAttribute("data-nav"));
