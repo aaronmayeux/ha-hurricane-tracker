@@ -886,55 +886,180 @@ function niceMiles(pxPerMile) {
   return best;
 }
 
-/* Far-offshore mileage scale: tick marks along the two edges opposite the house,
- * cumulative miles from that corner. Over open water only — any tick that would
- * fall on land, in the cone, or on storm data is dropped. */
-function scaleAxes(bbox, proj, geo, keepOut, conePx, hcx, hcy) {
+/* Mileage axes: one horizontal + one vertical tick ruler hugging two frame
+ * edges, numbered in cumulative miles from the corner where they meet.
+ *
+ * ARCHITECTURE -- returns an EMIT FUNCTION, not markup. The visible frame is
+ * not the 800x600 viewBox: in fill mode the letterbox slack reveals oxU/oyU
+ * extra user units of buffered map on each side, and _fitOverlays slides every
+ * anchored overlay out to those real edges. A scale laid out at build time
+ * against the default frame is wrong twice in fill mode -- its ticks stop at
+ * the 800-unit frame while water runs on, and it dodges legends at positions
+ * they've slid away from (the phantom mid-bottom gaps of 2026-07-19, three
+ * storms running). So build hands back `emit(oxU, oyU)`, buildConeSvg renders
+ * emit(0,0) into the initial svg, and _fitOverlays re-emits with the measured
+ * slack on every layout pass, swapping the .hu-scax groups in place. All
+ * collision inputs live in the closure; one emit is a few hundred Set lookups.
+ *
+ * RULES (Aaron, 2026-07-19):
+ * - ALWAYS SHOW. No farCase gate, no house involvement. `show_scale` decides.
+ * - ORIGIN = the corner whose two rulers yield the most surviving ticks over
+ *   water, with a thumb on the scale for bottom-left (then bottom-right /
+ *   top-left) so a close call lands where a reader expects a graph's zero.
+ * - Ticks SPAN blockers: a run continues past land/cone/furniture and resumes
+ *   over water -- a blocked tick is skipped, never fatal.
+ * - Deconfliction moves a ruler, it never kills one: each ruler lands on its
+ *   higher-yielding edge (numbers count from the origin either way, so the
+ *   flip never renumbers). An axis dies only if the whole frame can't hold 2.
+ * - MILEAGE ALWAYS LOSES: land, cone, tracks, model guidance, ww stripe,
+ *   coast/state lines, surge, wind field, city/pop dots, every label, legend,
+ *   note, the home marker and the top-right control cluster all outrank ticks.
+ *
+ * `boxes` = AABB keep-outs; screen-space ones carry `anch` ("bl", "r", "tr"...)
+ * and are slid by the letterbox slack before testing, exactly as _fitOverlays
+ * will slide the furniture itself. `conePx` + geo.land are tested as polygons
+ * at box centers (their EDGES ride the sampled-line grid, so a shoreline
+ * straddle is still caught). `blockPts` = everything stroked or dotted,
+ * pre-sampled to px and hashed into a coarse occupancy grid. */
+function scaleAxes(bbox, proj, geo, boxes, conePx, blockPts) {
   const midLng = (bbox[0] + bbox[2]) / 2, midLat = (bbox[1] + bbox[3]) / 2;
   const [, ya] = proj(midLng, midLat);
   const [, yb] = proj(midLng, midLat + 1);
   const pxPerMile = Math.abs(yb - ya) / 69.05;
-  if (!isFinite(pxPerMile) || pxPerMile <= 0) return [];
+  if (!isFinite(pxPerMile) || pxPerMile <= 0) return null;
   const step = niceMiles(pxPerMile), stepPx = step * pxPerMile;
-  if (stepPx < 44) return [];
+  if (stepPx < 44) return null;
 
-  const bottom = hcy < VBH / 2;
-  const left = hcx > VBW / 2;
-  const axisY = bottom ? VBH - 16 : 16;
-  const axisX = left ? 16 : VBW - 16;
   const landPx = ((geo && geo.land) || []).map((part) => part.map((c) => proj(c[0], c[1])));
-  const blocked = (x, y) => {
-    if (conePx.length >= 3 && pointInPoly(x, y, conePx)) return true;
-    for (const poly of landPx) if (poly.length >= 3 && pointInPoly(x, y, poly)) return true;
-    const box = { x1: x - 18, y1: y - 10, x2: x + 18, y2: y + 10 };
-    return keepOut.some((b) => boxHit(box, b));
+  // Per-polygon AABBs: most probes are over open water, so a bbox reject
+  // skips the expensive pointInPoly walk for nearly every land part.
+  const landBB = landPx.map((poly) => {
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (const [x, y] of poly) {
+      if (x < x1) x1 = x; if (x > x2) x2 = x;
+      if (y < y1) y1 = y; if (y > y2) y2 = y;
+    }
+    return [x1, y1, x2, y2];
+  });
+  const CELL = 8, lineCells = new Set();
+  for (const p of blockPts || [])
+    lineCells.add(((Math.floor(p[0] / CELL)) + "," + (Math.floor(p[1] / CELL))));
+  const OFF = 16;
+
+  let memoKey = null, memoRes = null;   // _fitOverlays re-runs with unchanged slack constantly
+  return function emit(oxU, oyU) {
+    const key = oxU.toFixed(1) + "|" + oyU.toFixed(1);
+    if (key === memoKey) return memoRes;
+    // Visible frame in user units. The buffered basemap really is drawn out
+    // there (no frame clip, see the svg assembly), so ticks are honest map.
+    const FL = -oxU, FR = VBW + oxU, FT = -oyU, FB = VBH + oyU;
+    // Slide each screen-anchored keep-out the same way _fitOverlays slides its
+    // furniture. Geographic boxes (no anch) stay put.
+    const sb = boxes.map((b) => {
+      const a = b.anch || "";
+      if (!a) return b;
+      const dx = a.includes("l") ? -oxU : a.includes("r") ? oxU : 0;
+      const dy = a.includes("t") ? -oyU : a.includes("b") ? oyU : 0;
+      return { x1: b.x1 + dx, y1: b.y1 + dy, x2: b.x2 + dx, y2: b.y2 + dy };
+    });
+    const free = (x1, y1, x2, y2) => {
+      if (x1 < FL + 2 || x2 > FR - 2 || y1 < FT + 2 || y2 > FB - 2) return false;
+      const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+      if (conePx.length >= 3 && pointInPoly(cx, cy, conePx)) return false;
+      for (let i = 0; i < landPx.length; i++) {
+        const bb = landBB[i];
+        if (cx < bb[0] || cx > bb[2] || cy < bb[1] || cy > bb[3]) continue;
+        if (landPx[i].length >= 3 && pointInPoly(cx, cy, landPx[i])) return false;
+      }
+      const box = { x1, y1, x2, y2 };
+      if (sb.some((b) => boxHit(box, b))) return false;
+      const gx2 = Math.floor(x2 / CELL), gy2 = Math.floor(y2 / CELL);
+      for (let gx = Math.floor(x1 / CELL); gx <= gx2; gx++)
+        for (let gy = Math.floor(y1 / CELL); gy <= gy2; gy++)
+          if (lineCells.has(gx + "," + gy)) return false;
+      return true;
+    };
+
+    /* Emitted coordinates vs tested coordinates: the group's data-anch slide
+     * (applied by _fitOverlays AFTER emission) moves a bottom axis down by oyU
+     * and a left axis left by oxU -- so the ANCHORED coordinate is emitted in
+     * default-frame units (VBH-16 / 16) but TESTED at its visible position,
+     * while the running coordinate is emitted AND tested in visible units
+     * (the slide doesn't touch that direction). */
+    const buildX = (bottom, ox) => {
+      const out = [], sx = ox < (FL + FR) / 2 ? 1 : -1;
+      const ay = bottom ? VBH - OFF : OFF;           // emitted (pre-slide)
+      const vy = bottom ? FB - OFF : FT + OFF;       // tested (visible)
+      const ty = ay + (bottom ? -10 : 17), y2t = ay + (bottom ? -7 : 7);
+      const tvy = vy + (bottom ? -10 : 17);
+      for (let k = 1; ; k++) {
+        const x = ox + sx * stepPx * k;
+        if (x < FL + 34 || x > FR - 34) break;
+        const txt = k === 1 ? withCommas(step) + " mi" : withCommas(step * k);
+        // Box tick + label off the real string width -- a flat +/-18
+        // under-measures "1,500 mi" and lets it sit on things.
+        const hw = Math.max(16, txt.length * 3.6 + 5);
+        if (!free(x - hw, Math.min(vy - 2, tvy - 11), x + hw, Math.max(vy + (bottom ? -7 : 7) + 2, tvy + 4))) continue;
+        out.push(`<line class="hu-scale-tick" x1="${x.toFixed(1)}" y1="${ay.toFixed(1)}" x2="${x.toFixed(1)}" y2="${y2t.toFixed(1)}"/>`);
+        out.push(`<text class="hu-scale-label" x="${x.toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="middle">${esc(txt)}</text>`);
+      }
+      return out;
+    };
+    const buildY = (left, oy) => {
+      const out = [], sy = oy > (FT + FB) / 2 ? -1 : 1;
+      const ax = left ? OFF : VBW - OFF;             // emitted (pre-slide)
+      const vx = left ? FL + OFF : FR - OFF;         // tested (visible)
+      for (let k = 1; ; k++) {
+        const y = oy + sy * stepPx * k;
+        if (y < FT + 34 || y > FB - 34) break;
+        const txt = withCommas(step * k);
+        const w = txt.length * 7.2 + 6;              // label runs inboard
+        const x1 = left ? vx - 2 : vx - w - 9, x2 = left ? vx + w + 9 : vx + 2;
+        if (!free(x1, y - 9, x2, y + 9)) continue;
+        out.push(`<line class="hu-scale-tick" x1="${ax.toFixed(1)}" y1="${y.toFixed(1)}" x2="${(ax + (left ? 7 : -7)).toFixed(1)}" y2="${y.toFixed(1)}"/>`);
+        out.push(`<text class="hu-scale-label" x="${(ax + (left ? 11 : -11)).toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="${left ? "start" : "end"}">${esc(txt)}</text>`);
+      }
+      return out;
+    };
+
+    /* THE ORIGIN IS THE CORNER WHERE THE AXES MEET -- full stop (Aaron,
+     * 2026-07-19, after two wrong cuts that let a ruler drift to the opposite
+     * edge "for room" and produced a y-axis counting DOWN from a top-left zero
+     * while sitting on the right edge). Each candidate corner is a PACKAGE:
+     * the x-ruler lives on that corner's horizontal edge, the y-ruler on its
+     * vertical edge, and BOTH number outward from the corner -- so a
+     * bottom-right origin reads right-to-left along the bottom and
+     * bottom-to-top up the right side, always. No independent edge flips.
+     *
+     * Corner choice: the package with the most surviving ticks wins ("the
+     * longest origination on both axes"), bottom-left taking near-ties via a
+     * small bonus, bottom-right/top-left next. Both rulers share one step and
+     * one px-per-mile, so the two scales are identical by construction. */
+    const corners = [
+      { left: true,  bottom: true,  bonus: 1.5 },   // bottom-left -- preferred
+      { left: false, bottom: true,  bonus: 0.75 },  // bottom-right
+      { left: true,  bottom: false, bonus: 0.75 },  // top-left
+      { left: false, bottom: false, bonus: 0 },     // top-right
+    ];
+    let best = null;
+    for (const c of corners) {
+      const ox = c.left ? FL + OFF : FR - OFF;
+      const oy = c.bottom ? FB - OFF : FT + OFF;
+      const xr = buildX(c.bottom, ox);   // x-ruler on the origin's horizontal edge
+      const yr = buildY(c.left, oy);     // y-ruler on the origin's vertical edge
+      const v = (xr.length + yr.length) / 2 + c.bonus;
+      if (!best || v > best.v) best = { v, c, xr, yr };
+    }
+
+    // Per-axis anchored groups (hu-scax marks them for _fitOverlays swap).
+    // A lone surviving tick is noise, not a scale: 2 minimum (2 nodes each).
+    const wrapA = (a, parts) => `<g class="hu-anch hu-scax" data-anch="${a}">${parts.join("")}</g>`;
+    const res = [];
+    if (best.xr.length >= 4) res.push(wrapA(best.c.bottom ? "b" : "t", best.xr));
+    if (best.yr.length >= 4) res.push(wrapA(best.c.left ? "l" : "r", best.yr));
+    memoKey = key; memoRes = res;
+    return res;
   };
-  const xout = [], yout = [];
-  const sx = left ? 1 : -1, sy = bottom ? -1 : 1;
-  for (let k = 1; ; k++) {
-    const x = axisX + sx * stepPx * k;
-    if (x < 34 || x > VBW - 34) break;
-    if (blocked(x, axisY)) continue;
-    xout.push(`<line class="hu-scale-tick" x1="${x.toFixed(1)}" y1="${axisY.toFixed(1)}" x2="${x.toFixed(1)}" y2="${(axisY + (bottom ? -7 : 7)).toFixed(1)}"/>`);
-    const txt = k === 1 ? withCommas(step) + " mi" : withCommas(step * k);
-    xout.push(`<text class="hu-scale-label" x="${x.toFixed(1)}" y="${(axisY + (bottom ? -10 : 17)).toFixed(1)}" text-anchor="middle">${esc(txt)}</text>`);
-  }
-  for (let k = 1; ; k++) {
-    const y = axisY + sy * stepPx * k;
-    if (y < 34 || y > VBH - 34) break;
-    if (blocked(axisX, y)) continue;
-    yout.push(`<line class="hu-scale-tick" x1="${axisX.toFixed(1)}" y1="${y.toFixed(1)}" x2="${(axisX + (left ? 7 : -7)).toFixed(1)}" y2="${y.toFixed(1)}"/>`);
-    yout.push(`<text class="hu-scale-label" x="${(axisX + (left ? 11 : -11)).toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="${left ? "start" : "end"}">${esc(withCommas(step * k))}</text>`);
-  }
-  // Wrap per axis with its visible-edge anchor: the tick row along the bottom/
-  // top edge shifts vertically, the column along the left/right edge shifts
-  // horizontally. Tick spacing is untouched -- a translate can't change
-  // pxPerMile -- only which edge the axis hugs.
-  const wrapA = (a, parts) => `<g class="hu-anch" data-anch="${a}">${parts.join("")}</g>`;
-  const res = [];
-  if (xout.length) res.push(wrapA(bottom ? "b" : "t", xout));
-  if (yout.length) res.push(wrapA(left ? "l" : "r", yout));
-  return res;
 }
 
 /* ---- build the SVG from one baked storm payload --------------------------- */
@@ -1108,6 +1233,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // normalized into the map's 360-degree window (same trick as the home marker)
   // so an antimeridian-straddling track draws the short way round.
   const modelRows = [];
+  const modelPts = [];   // sampled px points -> mileage-axis blockers (a tick must not sit on model guidance)
   if (models && models.list && models.list.length) {
     const cLng = (st.bbox[0] + st.bbox[2]) / 2;
     for (const m of models.list) {
@@ -1119,6 +1245,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
       });
       if (coords.length < 2) continue;
       storm.push(`<polyline class="hu-model" points="${ptsStr(proj, coords)}" stroke="${modelColor(m.id)}"/>`);
+      modelPts.push(...samplePoly(projectPart(proj, coords), 6));
       modelRows.push([m.label || m.id, modelColor(m.id)]);
     }
   }
@@ -1186,7 +1313,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   storm.push(...fdotGroups, ...flabelGroups);
 
   const homeParts = [];
-  let farCase = false, hcx = 0, hcy = 0, homeAnch = "";
+  let hcx = 0, hcy = 0, homeAnch = "";
   if (cfg.show_home !== false && st.home && st.home[0] != null) {
     // Home projects like everything else -- the marker sits where home actually
     // is on THIS map, and the chevron aims at it. See homeScreenPt for the
@@ -1224,7 +1351,6 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
         x1: Math.min(inX, outX, hcx) - P, y1: Math.min(inY, outY, hcy) - P,
         x2: Math.max(inX, outX, hcx) + P, y2: Math.max(inY, outY, hcy) + P,
       });
-      farCase = true;
     }
   }
 
@@ -1252,7 +1378,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
       if (col) mlegend.push(`<line class="hu-mlegend-sw" x1="${x0 + padX}" y1="${cy.toFixed(1)}" x2="${x0 + padX + 18}" y2="${cy.toFixed(1)}" stroke="${col}"/>`);
       mlegend.push(`<text class="hu-mlegend-t hu-ml-t" x="${x0 + padX + (col ? 24 : 0)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
     });
-    keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+    keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4, anch: "bl" });
   }
 
   // E5 surge legend: bottom-right screen-space furniture (hu-overlays; hides on
@@ -1333,7 +1459,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
         else
           slegend.push(`<text class="hu-mlegend-t hu-note-t" text-anchor="end" x="${(x0 + w - padX).toFixed(1)}" y="${(cy + 3.5).toFixed(1)}">${esc(label)}</text>`);
       });
-      keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4 });
+      keepScreen.push({ x1: x0 - 4, y1: y0 - 4, x2: x0 + w + 4, y2: y0 + h + 4, anch: "br" });
     }
   }
 
@@ -1347,8 +1473,47 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     for (const [gx, gy, gp] of gridPts)
       if (pointInPoly(gx, gy, conePx)) popImpact += gp || 0;
   }
-  const scale = (farCase && cfg.show_scale !== false)
-    ? scaleAxes(st.bbox, proj, st.geo, keepOut.concat(keepScreen), conePx, hcx, hcy) : [];
+  /* Blockers for the mileage axes that AREN'T keep-out boxes and aren't the
+   * cone/land fills scaleAxes tests itself: every stroked line and dot on the
+   * map, sampled to px. Land, text, cone, lines, legends and notes all outrank
+   * a mileage tick -- so anything drawn here has to be visible to the ruler's
+   * collision test or it will be drawn over. */
+  const scaleBlockPts = [];
+  // Append by loop, never `push(...arr)`: a buffered coastline sampled at 6 px
+  // runs to tens of thousands of points and a spread that wide blows the
+  // argument-count limit.
+  const addPts = (arr) => { for (let i = 0; i < arr.length; i++) scaleBlockPts.push(arr[i]); };
+  addPts(trackPts);                                // past + forecast track
+  addPts(modelPts);                                // E4 model guidance
+  if (triStripe === "left")
+    for (const seg of st.ww || [])
+      if (seg.coords && seg.coords.length >= 2)
+        addPts(samplePoly(projectPart(proj, seg.coords), 6));
+  if (cfg.show_coast !== false)
+    for (const part of (st.geo && st.geo.coast) || [])
+      if (part.length >= 2) addPts(samplePoly(part.map((c) => proj(c[0], c[1])), 6));
+  if (cfg.show_states !== false)
+    for (const part of (st.geo && st.geo.states) || [])
+      if (part.length >= 2) addPts(samplePoly(part.map((c) => proj(c[0], c[1])), 6));
+  if (windSrc && windSrc.length)
+    for (const w of windSrc)
+      for (const ring of w.rings || [])
+        if (ring.length >= 3) addPts(samplePoly(ring.map((c) => proj(c[0], c[1])), 8));
+  if (triStripe === "right" && lay.surge && lay.surge.bands)
+    for (const b of lay.surge.bands)
+      for (const ring of b.rings || [])
+        if (ring.length >= 3)
+          addPts(samplePoly(ring.map(([lng, lat]) => proj(normLng(lng), lat)), 8));
+  for (const c of ctxCities) scaleBlockPts.push([c.x, c.y]);
+  if (gridPts) for (const g of gridPts) scaleBlockPts.push([g[0], g[1]]);
+  // The top-right control cluster (Recenter/advisory/gear) is HTML painted
+  // OVER the svg and pinned to the card's top-right corner -- same dodge the
+  // off-frame home marker makes (TK_X1/TK_Y2), now visible to the ruler too.
+  const scaleBoxes = keepOut.concat(keepScreen,
+    [{ x1: VBW - 120, y1: 0, x2: VBW, y2: 58, anch: "tr" }]);
+  const scaleEmit = (cfg.show_scale !== false)
+    ? scaleAxes(st.bbox, proj, st.geo, scaleBoxes, conePx, scaleBlockPts) : null;
+  const scale = scaleEmit ? scaleEmit(0, 0) : [];
 
   // E6 label-engine context: everything layoutZoomLabels needs to re-place the
   // region/city labels at ANY view, precomputed in default-frame px. Region
@@ -1413,7 +1578,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
     + `<g class="hu-pan">${panGroup.join("")}</g>`
     + `<g class="hu-overlays">${overlayGroup.join("")}</g>`
     + `</svg>`;
-  return { svg, ctx, popImpact };
+  return { svg, ctx, popImpact, scaleEmit };
 }
 
 /* The storm's display name + classification tag, e.g. "Elida (TS)". Hoisted out
@@ -2274,10 +2439,12 @@ class HurricaneCard extends HTMLElement {
         lay.surge = this._layerState("surge", st);
       let svg = "", popImpact = null;
       this._labelCtx = null;   // E6: engine context, set only on a successful build
+      this._scaleEmit = null;  // mileage-axis emitter, ditto (re-run per layout pass)
       try {
         const built = buildConeSvg(st, cfg, modelState, prefs, lay);
         svg = built.svg;
         this._labelCtx = built.ctx;
+        this._scaleEmit = built.scaleEmit;
         popImpact = built.popImpact;
       }
       catch (e) { svg = this._msg("mdi:map-marker-alert", "Couldn\u2019t draw this storm", "", false); }
@@ -2710,6 +2877,22 @@ class HurricaneCard extends HTMLElement {
     const s = Math.min(r.width / VBW, r.height / VBH) || 1;
     const oxU = Math.max(0, r.width / s - VBW) / 2;
     const oyU = Math.max(0, r.height / s - VBH) / 2;
+    /* Mileage axes re-emit against the REAL visible frame: ticks span the full
+     * letterbox width and collide with furniture at its post-slide positions
+     * (a build-time layout got both wrong in fill mode -- the phantom
+     * mid-bottom gaps of 2026-07-19). Swap-in-place before the anchor pass
+     * below so the fresh groups pick up their edge translate like everyone
+     * else. Idempotent: same slack -> same markup. */
+    if (this._scaleEmit) {
+      const ov = svg.querySelector(".hu-overlays");
+      if (ov) {
+        ov.querySelectorAll("g.hu-scax").forEach((g) => g.remove());
+        const fresh = this._scaleEmit(oxU, oyU).join("");
+        // afterbegin: first in the overlay group = painted UNDER the legends,
+        // home marker and every other overlay. Mileage always loses.
+        if (fresh) ov.insertAdjacentHTML("afterbegin", fresh);
+      }
+    }
     svg.querySelectorAll("g.hu-anch").forEach((g) => {
       const a = g.getAttribute("data-anch") || "";
       const dx = a.includes("l") ? -oxU : a.includes("r") ? oxU : 0;
