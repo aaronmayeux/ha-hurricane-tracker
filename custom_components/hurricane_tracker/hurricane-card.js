@@ -1897,6 +1897,10 @@ const STYLE = `
   .hu-svg { display: block; width: 100%; height: auto; touch-action: none; }
   .hu-svg.hu-zoomable { cursor: grab; }
   .hu-svg.hu-zoomable.hu-grabbing { cursor: grabbing; }
+  /* Pan/zoom OFF (gear panel, per-device): restore normal touch scrolling so a
+     swipe over the map scrolls the DASHBOARD instead of being eaten by the
+     gesture layer's touch-action:none. */
+  .hu-svg.hu-locked { touch-action: pan-y; }
   .hu-pan { will-change: transform; }
   .hu-model { fill: none; stroke-width: 1.6; stroke-dasharray: 5 4; opacity: .85;
               stroke-linejoin: round; stroke-linecap: round; }
@@ -2480,6 +2484,15 @@ class HurricaneCard extends HTMLElement {
           panelRows += `<label class="hu-panel-row"><span class="hu-row-lbl">${esc(b.title)}</span><input type="checkbox" class="hu-sw" data-layvis="${b.key}" ${layoutOn(this._layoutPrefs, b.key) ? "checked" : ""}/></label>`;
         panelRows += `<div class="hu-lay-note">Side needs a wide card with a set height — otherwise it falls back to Bottom. The at-home graph only appears when a storm is forecast to reach your home. Saved on this device only.</div>`;
       }
+      // Map pan/zoom lock: per-device (same store/key mechanism as the blocks
+      // above), plain on/off, reuses the generic data-layvis wiring below --
+      // no new load/save/listener code needed. Default ON (unchanged behavior);
+      // unchecking stops _setupPanZoom from ever attaching the gesture layer.
+      {
+        panelRows += `<div class="hu-panel-group">Map</div>
+          <label class="hu-panel-row"><span class="hu-row-lbl">Pan &amp; zoom</span><input type="checkbox" class="hu-sw" data-layvis="panZoomOn" ${layoutOn(this._layoutPrefs, "panZoomOn") ? "checked" : ""}/></label>
+          <div class="hu-lay-note">Turn off so a swipe or scroll over the map doesn’t drag it — the gesture goes to the dashboard instead. Saved on this device only.</div>`;
+      }
       for (const t of TRI_GROUPS) {
         const na = t.nhcOnly && !nhcSt;
         const v = na ? t.def : triState(prefs, t.key);
@@ -2940,6 +2953,14 @@ class HurricaneCard extends HTMLElement {
     const reset = this._resetView === true || this._viewStormId !== stormId;
     this._resetView = false;
     if (!svg) { this._view = null; this._savedView = null; this._viewStormId = stormId; return; }
+    if (!layoutOn(this._layoutPrefs, "panZoomOn")) {
+      // Gear-panel lock: skip the gesture layer entirely -- no listeners attached,
+      // map stays at the default frame, and .hu-locked hands touch scrolling back
+      // to the dashboard (see the .hu-svg.hu-locked rule).
+      svg.classList.add("hu-locked");
+      this._view = null; this._savedView = null; this._viewStormId = stormId;
+      return;
+    }
     const pan = svg.querySelector(".hu-pan");
     const overlays = svg.querySelector(".hu-overlays");
     const btn = this.shadowRoot.querySelector(".hu-recenter");
