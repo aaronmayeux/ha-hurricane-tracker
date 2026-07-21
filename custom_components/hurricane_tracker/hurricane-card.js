@@ -1203,7 +1203,7 @@ function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
       }
       imgCap.push(`<g class="hu-imgcap${amber ? " hu-amber" : ""}">`
         + `<text x="12" y="20">${esc(lbl)} <tspan class="hu-imgcap-sub">${esc(sub)}</tspan></text>`
-        + (st.advisory ? `<text class="hu-imgcap-sub" x="12" y="34">NHC advisory ${esc(String(st.advisory))}</text>` : "")
+        + ((st.advisoryTime || st.advisory) ? `<text class="hu-imgcap-sub" x="12" y="34">${st.advisoryTime ? "Track issued " + esc(fmtLocal(st.advisoryTime)) : "NHC advisory " + esc(String(st.advisory))}</text>` : "")
         + `</g>`);
     }
   }
@@ -2623,7 +2623,7 @@ class HurricaneCard extends HTMLElement {
       else { sub = img.observed ? "as of " + fmtLocal(img.observed) : "live"; if (img.stale) { sub += " · last good"; amber = true; } }
       capNode.classList.toggle("hu-amber", amber);
       capNode.innerHTML = `<text x="12" y="20">${esc(lbl)} <tspan class="hu-imgcap-sub">${esc(sub)}</tspan></text>`
-        + (st.advisory ? `<text class="hu-imgcap-sub" x="12" y="34">NHC advisory ${esc(String(st.advisory))}</text>` : "");
+        + ((st.advisoryTime || st.advisory) ? `<text class="hu-imgcap-sub" x="12" y="34">${st.advisoryTime ? "Track issued " + esc(fmtLocal(st.advisoryTime)) : "NHC advisory " + esc(String(st.advisory))}</text>` : "");
     }
   }
   /* Bound a string-keyed cache to `max` newest entries (JS preserves insertion

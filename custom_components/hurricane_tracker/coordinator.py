@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -159,6 +159,7 @@ def _build(home_lat, home_lon, basin, units, storm_filter, range_mi=None,
             if pl:
                 # Fresh, good bake: serve it and cache it (not stale).
                 pl["stale"] = False
+                pl["advisoryTime"] = _advisory_ms(storm)   # track 'issued' time
                 payloads.append(pl)
                 if sid:
                     cache[sid] = {"payload": pl, "ts": now_ms}
@@ -199,6 +200,25 @@ def _build(home_lat, home_lon, basin, units, storm_filter, range_mi=None,
             "anyStale": any(p.get("stale") for p in payloads),
             "anyFresh": baked_ok, "ts": now_ms,
             "layerMeta": _layer_meta(selected[:MAX_STORMS], home_lat, home_lon)}
+
+
+def _advisory_ms(storm):
+    """Epoch ms of the public advisory's issuance time (CurrentStorms.json
+    `publicAdvisory.issuance`, ISO-8601 UTC), or None. The card renders this as
+    the track's 'issued' time beside the imagery timestamp so the two can be
+    compared. GDACS storms and older cached payloads carry no issuance -> None
+    -> the card falls back to the advisory number."""
+    pub = storm.get("publicAdvisory")
+    iso = pub.get("issuance") if isinstance(pub, dict) else None
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
 
 
 def _layer_meta(storms, home_lat=None, home_lon=None):
