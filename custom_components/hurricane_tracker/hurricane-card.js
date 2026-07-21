@@ -210,11 +210,21 @@ const CITY_DOT_DRAW = 30;
  * hexes). symbolid is matched by color word; unknown falls back by index. */
 const SURGE_COLOR = { blue: "#64B5F6", yellow: "#FFE14D", orange: "#FB8C00", red: "#E53935", purple: "#AB47BC" };
 const SURGE_ORDER = ["blue", "yellow", "orange", "red", "purple"];
-function surgeColor(band, i) {
+/* Severity index (0=blue .. 4=purple) for one band: matched by color word in
+ * symbolid, falling back by feature index -- ONE resolver so the fill color,
+ * the paint order, and the legend can never disagree (v0.2.7). */
+function surgeSev(band, i) {
   const s = String((band && band.sym) || "").toLowerCase();
-  for (const k of SURGE_ORDER) if (s.includes(k)) return SURGE_COLOR[k];
-  return SURGE_COLOR[SURGE_ORDER[Math.min(Math.max(i, 0), 4)]];
+  for (let k = 0; k < SURGE_ORDER.length; k++) if (s.includes(SURGE_ORDER[k])) return k;
+  return Math.min(Math.max(i, 0), 4);
 }
+function surgeColor(band, i) { return SURGE_COLOR[SURGE_ORDER[surgeSev(band, i)]]; }
+/* Legend labels by severity index, VERBATIM from the service's own legend
+ * (NHC_PeakStormSurge MapServer layer 2, fetched 2026-07-21): color -> peak
+ * inundation height. The feature `name` field is a PLACE (bay/reach) and is
+ * deliberately never shown -- the legend answers "how deep", the map answers
+ * "where" (v0.2.7 settled). */
+const SURGE_FT = ["Up to 3 ft", "Up to 6 ft", "Up to 9 ft", "Up to 12 ft", "Above 12 ft"];
 /* NHC storm ids are basin-prefixed (al/ep/cp + number + year); GDACS ids are
  * bare event numbers. Gates the NHC-only layers (model tracks). */
 const isNhcId = (sid) => /^(al|ep|cp)\d/i.test(sid || "");
@@ -860,7 +870,10 @@ function pointInPoly(x, y, poly) {
  * Screen-space overlay boxes (home marker, model legend) apply only at the
  * default frame -- the overlays are hidden everywhere else. */
 const REGION_CHAR_W = 8.6;   // ~14px uppercase sans-serif (matches .hu-region)
-/* Nudge offsets tried in order (px). Anchor first, then toward open water nearby. */
+const REGION_STATE_SPAN = 30;   // effective span (deg) at/below which tier-1 (state/province) names show; wider frames show countries only
+const CITY_CHAR_W = 7.0;     // ~14px mixed-case sans-serif (matches .hu-city-label)
+const CITY_GAP = 6;          // dot-to-label gap (was the old hard-pinned x=6)
+/* Nudge offsets tried in order (px). Anchor first, then to nearby clear space. */
 const REGION_NUDGES = [[0, 0], [0, 15], [0, -15], [16, 0], [-16, 0], [0, 28], [0, -28], [22, 14], [-22, 14], [22, -14], [-22, -14], [0, 42], [0, -42]];
 function layoutZoomLabels(ctx, view) {
   const s = view.s || 1, tx = view.tx || 0, ty = view.ty || 0;
@@ -876,20 +889,19 @@ function layoutZoomLabels(ctx, view) {
   });
   const atDefault = s <= 1.001 && s >= 0.999 && Math.abs(tx) < 0.5 && Math.abs(ty) < 0.5;
   if (atDefault) keep.push(...ctx.keepScreen);
-  const conePx = ctx.conePx.map(([x, y]) => T(x, y));
   const k = (1 / s).toFixed(4);
   const zl = (ax, ay, inner) =>
     `<g class="hu-zl" data-ax="${ax.toFixed(1)}" data-ay="${ay.toFixed(1)}" transform="translate(${ax.toFixed(1)} ${ay.toFixed(1)}) scale(${k})">${inner}</g>`;
 
   // Region names: tier gate on the EFFECTIVE span (zooming in reveals states),
   // anchor must be on the current frame (panning into the buffer reveals more),
-  // then the same nudge-to-open-water pass as ever -- all in screen space.
+  // then nudge to clear OTHER TEXT only -- other names + the forecast time labels
+  // + corner furniture (all in `keep`). NOT the cone or any graphics: they're
+  // translucent and a name reads fine over them (Aaron, 2026-07-21). Screen space.
   const placed = [], regions = [];
-  const maxTier = (ctx.span / s) > 16 ? 0 : 1;
+  const maxTier = (ctx.span / s) > REGION_STATE_SPAN ? 0 : 1;
   const clear = (box) => {
     if (box.x1 < 22 || box.x2 > VBW - 22 || box.y1 < 14 || box.y2 > VBH - 14) return false;
-    const my = (box.y1 + box.y2) / 2;
-    if (conePx.length >= 3 && [box.x1 + 2, (box.x1 + box.x2) / 2, box.x2 - 2].some((px) => pointInPoly(px, my, conePx))) return false;
     if (keep.some((b) => boxHit(box, b))) return false;
     if (placed.some((b) => boxHit(box, b))) return false;
     return true;
@@ -910,18 +922,39 @@ function layoutZoomLabels(ctx, view) {
       `<text class="hu-region" x="${(hit.x - sax).toFixed(1)}" y="${(hit.y - say + 4).toFixed(1)}">${esc(r.name)}</text>`));
   }
 
-  // City dots + labels: dots always draw (constant on-screen size); text thins
-  // on a 64 px min-gap at the CURRENT view, biggest population first, and only
-  // cities on or near the current frame compete for a label slot (an off-frame
-  // metro no longer suppresses an on-frame town's name).
-  const taken = [], cities = [];
+  // City dots + labels: dots always draw (constant on-screen size). Labels are
+  // placed by the same nudge-and-test pass as region names (Pass D): biggest
+  // population first, try the dot's right / left / above / below in turn, and
+  // keep the first box that clears the storm keep-outs, the region names, the
+  // frame edge, and every city label already placed -- else drop the TEXT but
+  // keep the dot. No cone test: cities legitimately sit inside the cone (unlike
+  // region names), and dropping the name still leaves the dot as the marker.
+  const cityBoxes = [], cities = [];
+  const cityClear = (box) => {
+    if (box.x1 < 2 || box.x2 > VBW - 2 || box.y1 < 2 || box.y2 > VBH - 2) return false;
+    if (keep.some((b) => boxHit(box, b))) return false;
+    if (placed.some((b) => boxHit(box, b))) return false;
+    if (cityBoxes.some((b) => boxHit(box, b))) return false;
+    return true;
+  };
   for (const p of ctx.cities) {
     const [sx, sy] = T(p.x, p.y);
     let txt = "";
-    if (sx > -40 && sx < VBW + 40 && sy > -40 && sy < VBH + 40
-        && !taken.some((t) => Math.hypot(t[0] - sx, t[1] - sy) < 64)) {
-      taken.push([sx, sy]);
-      txt = `<text class="hu-city-label" x="6" y="3.5">${esc(p.name)}</text>`;
+    if (sx > -40 && sx < VBW + 40 && sy > -40 && sy < VBH + 40) {
+      const w = String(p.name).length * CITY_CHAR_W;
+      const cands = [
+        { x1: sx + CITY_GAP,     y1: sy - 7.5, x2: sx + CITY_GAP + w, y2: sy + 7.5, tx: CITY_GAP,  ty: 3.5, anc: "start"  },
+        { x1: sx - CITY_GAP - w, y1: sy - 7.5, x2: sx - CITY_GAP,     y2: sy + 7.5, tx: -CITY_GAP, ty: 3.5, anc: "end"    },
+        { x1: sx - w / 2,        y1: sy - 21,  x2: sx + w / 2,        y2: sy - 6,   tx: 0,          ty: -11, anc: "middle" },
+        { x1: sx - w / 2,        y1: sy + 4,   x2: sx + w / 2,        y2: sy + 18,  tx: 0,          ty: 15,  anc: "middle" },
+      ];
+      for (const c of cands) {
+        if (cityClear(c)) {
+          cityBoxes.push(c);
+          txt = `<text class="hu-city-label" x="${c.tx.toFixed(1)}" y="${c.ty.toFixed(1)}" text-anchor="${c.anc}">${esc(p.name)}</text>`;
+          break;
+        }
+      }
     }
     cities.push(zl(p.x, p.y, `<circle class="${p.cls || "hu-city"}" r="${(p.r || 2.6).toFixed(1)}"/>` + txt));
   }
@@ -1175,16 +1208,20 @@ function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
     }
   }
   const smooth = cfg.smooth !== false;
-  const base = [];
+  // v0.2.7: the basemap is split in two so surge can slot BETWEEN the land
+  // fill and the border strokes -- flooded area paints over land but under
+  // state/coast lines, so borders stay readable through the opaque fill
+  // (Aaron, on glass 2026-07-21).
+  const baseFill = [], baseLines = [];
   if (cfg.show_land !== false)
     for (const part of (st.geo && st.geo.land) || [])
-      if (part.length >= 3) base.push(`<path class="hu-land" d="${basePath(proj, part, true, smooth)}"/>`);
+      if (part.length >= 3) baseFill.push(`<path class="hu-land" d="${basePath(proj, part, true, smooth)}"/>`);
   if (cfg.show_states !== false)
     for (const part of (st.geo && st.geo.states) || [])
-      if (part.length >= 2) base.push(`<path class="hu-state" d="${basePath(proj, part, false, false)}"/>`);   // political borders drawn straight (never curve-smoothed)
+      if (part.length >= 2) baseLines.push(`<path class="hu-state" d="${basePath(proj, part, false, false)}"/>`);   // political borders drawn straight (never curve-smoothed)
   if (cfg.show_coast !== false)
     for (const part of (st.geo && st.geo.coast) || [])
-      if (part.length >= 2) base.push(`<path class="hu-coast" d="${basePath(proj, part, false, smooth)}"/>`);
+      if (part.length >= 2) baseLines.push(`<path class="hu-coast" d="${basePath(proj, part, false, smooth)}"/>`);
 
   // Phase 3 wind field: nested semi-transparent fills (34/50/64 kt), theme text
   // color, no outline/legend. Overlap stacks alpha so the core reads brighter.
@@ -1288,18 +1325,33 @@ function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
     }
   }
 
-  // E5 storm surge (stripe-right, on-demand): inundation bands drawn as filled
-  // coastal polygons UNDER the storm data, NHC's blue->purple severity ramp.
-  // Geometry arrives pre-simplified from the layer websocket; no smoothing
-  // (these are detailed coastal fills -- curves would misplace water lines).
+  // E5 storm surge (stripe-right, on-demand), v0.2.7 paint: every ring of one
+  // severity unions into ONE nonzero-winding path (the wind-blob trick -- no
+  // seams inside a band), painted ASCENDING so where bands overlap the worst
+  // amount wins on top. Fills are opaque (ww-stripe weight) and drawn under
+  // the border strokes; rings ride the same Catmull-Rom smoother as the wind
+  // radii and coast. The smoother can drift a curve slightly off the data
+  // between points -- accepted: the source is already server-generalized, and
+  // organic edges read better than DP jaggies (Aaron, on glass 2026-07-21).
   const surgeLayer = [];
-  if (triStripe === "right" && lay.surge && lay.surge.bands)
+  if (triStripe === "right" && lay.surge && lay.surge.bands) {
+    const sevD = [];   // severity index -> merged path data (sparse)
     lay.surge.bands.forEach((b, i) => {
-      let d = "";
+      const sev = surgeSev(b, i);
+      let d = sevD[sev] || "";
       for (const ring of b.rings || [])
-        if (ring.length >= 3) d += basePath(proj, ring.map(([lng, lat]) => [normLng(lng), lat]), true, false);
-      if (d) surgeLayer.push(`<path class="hu-surge" style="fill:${surgeColor(b, i)}" d="${d}"/>`);
+        if (ring.length >= 3) d += basePath(proj, ring.map(([lng, lat]) => [normLng(lng), lat]), true, smooth);
+      sevD[sev] = d;
     });
+    sevD.forEach((d, sev) => {
+      // Stroke in the SAME color as the fill: a round-joined stroke dilates
+      // every shape by half its width, so thin threads read as ribbons and
+      // nearby speckles merge into contiguous patches (v0.2.7, Aaron's call).
+      // Width lives in the .hu-surge CSS rule -- the one tuning knob.
+      const c = SURGE_COLOR[SURGE_ORDER[sev]];
+      if (d) surgeLayer.push(`<path class="hu-surge" style="fill:${c};stroke:${c}" d="${d}"/>`);
+    });
+  }
 
   const storm = [];
   // Watch/warning stripe. `traced` segments were re-cut server-side from the
@@ -1314,6 +1366,11 @@ function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
       if (col && seg.coords && seg.coords.length >= 2)
         storm.push(`<path class="hu-ww" d="${basePath(proj, seg.coords, false, smooth && seg.traced === true)}" stroke="${col}"/>`);
     }
+  // v0.2.7 cone toggle: "off" hides the POLYGON only. conePx above keeps
+  // feeding the in-cone population count and the mileage-scale keep-out.
+  // The polygon is ALWAYS emitted (when cone data exists); the on/off is a CSS
+  // class on the root (.hu-cone-off) so the toggle is a class flip in place, not
+  // a full rebuild that blinks every label (Aaron, 2026-07-21).
   if (st.cone && st.cone.length >= 3)
     storm.push(`<polygon class="hu-cone-poly" points="${ptsStr(proj, st.cone)}"/>`);
   if (st.pastTrack && st.pastTrack.length >= 2)
@@ -1488,14 +1545,16 @@ function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
     const rows = [];
     if (triStripe === "right" && lay.surge
         && (lay.surge.loading || lay.surge.failed || (lay.surge.bands && lay.surge.bands.length))) {
-      const seen = new Set();
-      if (lay.surge.bands)
-        lay.surge.bands.forEach((b, i) => {
-          const lbl = b.label || "Surge area";
-          if (seen.has(lbl) || rows.length >= 5) return;
-          seen.add(lbl);
-          rows.push([lbl, surgeColor(b, i)]);
-        });
+      // v0.2.7: a header + one row per severity PRESENT, worst first, labeled
+      // with the service's own inundation heights (SURGE_FT) -- never the
+      // feature `name` field, which is a place label (settled: color -> ft).
+      if (lay.surge.bands && lay.surge.bands.length) {
+        const present = new Set();
+        lay.surge.bands.forEach((b, i) => present.add(surgeSev(b, i)));
+        rows.push(["Peak storm surge", null]);
+        [...present].sort((a, b) => b - a)
+          .forEach((sev) => rows.push([SURGE_FT[sev], SURGE_COLOR[SURGE_ORDER[sev]]]));
+      }
       // Two DIFFERENT facts, deliberately not collapsed into one string: a
       // failed fetch means we don't know, while a clean fetch with zero bands
       // means NHC has published none. Same distinction the coastal-warning note
@@ -1644,7 +1703,8 @@ function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
   // maxScale ride as data-attrs so the gesture layer can read the pannable extent
   // + zoom ceiling off the DOM. Returns {svg, ctx}: the card stashes ctx for the
   // engine's re-runs.
-  const panGroup = [...imageryEls, ...base, ...windLayer, ...surgeLayer, ...gridDots,
+  // v0.2.7 stacking: land fill -> surge -> border strokes -> wind -> the rest.
+  const panGroup = [...imageryEls, ...baseFill, ...surgeLayer, ...baseLines, ...windLayer, ...gridDots,
     `<g class="hu-zl-cities">${zl0.cities}</g>`, ...storm,
     `<g class="hu-zl-regions">${zl0.regions}</g>`];
   // Screen-space furniture re-anchors to the VISIBLE edges (._fitOverlays):
@@ -1729,9 +1789,14 @@ function dataBar(st, lay, popImpact) {
     }
   }
   // E5 surge at-home line: present only while the surge layer is selected AND
-  // home sits inside a returned band. The label is NHC's own band text.
+  // home sits inside a returned band. v0.2.7: name the DEPTH (service ft
+  // label via atHomeSev), not the feature `name` -- that's a bay/reach place
+  // label. Older cached results lack atHomeSev; fall back to the raw name
+  // rather than dropping the fact.
   if (lay && lay.surge && lay.surge.ok && lay.surge.atHome)
-    bits.push(`surge at home: ${lay.surge.atHome}`);
+    bits.push(`surge at home: ${
+      lay.surge.atHomeSev != null && SURGE_FT[lay.surge.atHomeSev]
+        ? SURGE_FT[lay.surge.atHomeSev] : lay.surge.atHome}`);
   // E5 population impact (Population dot mode): honest about the undercount --
   // only mapped places (>= 5k, GeoNames) are summed.
   if (popImpact != null && popImpact > 0)
@@ -2038,6 +2103,19 @@ const STYLE = `
                     color: var(--secondary-text-color); margin: 12px 0 6px; display: flex;
                     align-items: baseline; gap: 6px; }
   .hu-panel-group:first-child { margin-top: 0; }
+  /* In-menu fetch spinner (v0.2.7): sits in the group header / row label of a
+   * layer that is fetching RIGHT NOW. The open panel covers the map legend
+   * where the SVG "Loading…" rows render, so the feedback lives in here too. */
+  .hu-panel-spin { --mdc-icon-size: 13px; width: 13px; height: 13px; flex: none; align-self: center;
+                   color: var(--secondary-text-color); animation: hu-spin 1.4s linear infinite; }
+  /* Section break between the synced map-content controls (top) and the
+   * per-device card-shape controls (bottom): 3 save behaviors, 2 visible
+   * blocks, 1 caption saying "this device" instead of three notes (v0.2.7). */
+  .hu-panel-sec { font: 700 10.5px/1 sans-serif; letter-spacing: .08em; text-transform: uppercase;
+                  color: var(--secondary-text-color); margin: 14px 0 2px; padding-top: 10px;
+                  border-top: 1px solid var(--divider-color, rgba(127,127,127,.3)); }
+  /* First line of a switch-row label: label text + optional busy spinner. */
+  .hu-lbl-line { display: flex; align-items: center; gap: 6px; }
   /* M3 segmented button: full-width pill, hairline outline, equal segments,
    * selected segment tinted with the theme primary. Disabled group = 38%. */
   .hu-seg { display: flex; width: 100%; height: 32px; box-sizing: border-box;
@@ -2081,7 +2159,13 @@ const STYLE = `
                  font: 400 13px/1.45 ui-monospace, Menlo, Consolas, monospace; }
   .hu-adv-wait { display: flex; justify-content: center; padding: 30px 0; }
   .hu-adv-sub { font-size: 13px; color: var(--secondary-text-color); text-align: center; padding: 20px 0; }
-  .hu-land { fill: var(--hu-land-color, var(--divider-color)); opacity: var(--hu-land-opacity, .55); stroke: none; }
+  /* v0.2.7: land carries its own thin stroke so every filled mass keeps an
+   * edge even when its SEPARATE coast piece was simplified away (small
+   * islands). Coast draws over it heavier, so where both survive this only
+   * thickens the line a hair -- don't chase coast-data completeness instead. */
+  .hu-land { fill: var(--hu-land-color, var(--divider-color)); opacity: var(--hu-land-opacity, .55);
+             stroke: var(--hu-coast-color, var(--primary-text-color)); stroke-width: .5;
+             stroke-opacity: .55; stroke-linejoin: round; }
   .hu-state { fill: none; stroke: var(--hu-state-color, var(--secondary-text-color)); stroke-width: var(--hu-state-width, .6); opacity: .4; }
   .hu-coast { fill: none; stroke: var(--hu-coast-color, var(--primary-text-color)); stroke-width: var(--hu-coast-width, 1); opacity: var(--hu-coast-opacity, .7); stroke-linejoin: round; stroke-linecap: round; }
   .hu-region { font: 600 14px/1 sans-serif; letter-spacing: .1em; text-transform: uppercase;
@@ -2095,10 +2179,18 @@ const STYLE = `
                     paint-order: stroke; stroke: var(--hu-bg, var(--primary-background-color)); stroke-width: 3px; }
   .hu-wind { fill-opacity: .42; stroke: none; }
   .hu-ww { fill: none; stroke-width: 2; stroke-linecap: round; }
-  .hu-surge { fill-opacity: .5; stroke: none; }
+  /* v0.2.7: opaque like the ww stripe -- the old 50% chips stacked into mud.
+   * Worst-band-on-top paint order + sitting under the border strokes do the
+   * reading work that transparency was failing to do. The same-color stroke
+   * fattens the flood-model splatter into solid cartography: ~1.5px of
+   * dilation at default zoom (a km or two of honest exaggeration, the same
+   * legibility trade NHC's own public surge map makes). stroke-width is THE
+   * tuning knob for how chunky surge reads -- tune on glass. */
+  .hu-surge { fill-opacity: 1; stroke-width: 5; stroke-linejoin: round; stroke-linecap: round; }
   .hu-popdot { fill: #4FC3F7; stroke: rgba(0,0,0,.35); stroke-width: .5; }
   .hu-slegend-sw { stroke: rgba(0,0,0,.3); stroke-width: .5; }
   .hu-cone-poly { fill: var(--hu-cone-color, var(--primary-text-color)); fill-opacity: .08; stroke: var(--hu-cone-color, var(--primary-text-color)); stroke-opacity: .3; stroke-width: 1; }
+  .hu-cone-off .hu-cone-poly { display: none; }
   .hu-track-past { fill: none; stroke: var(--hu-track-past-color, var(--secondary-text-color)); stroke-width: 2; stroke-dasharray: 4 5; opacity: .6; }
   .hu-track-fcst { fill: none; stroke: var(--hu-track-color, var(--primary-text-color)); stroke-width: 2.5; opacity: .85; }
   .hu-fdot { stroke: rgba(0,0,0,.35); stroke-width: 1; }
@@ -2475,11 +2567,11 @@ class HurricaneCard extends HTMLElement {
       else
         this._imgCache[key] = { ts: Date.now(), failed: true };
       this._capCache(this._imgCache, IMG_CACHE_MAX);
-      this._render();
+      this._refreshImageryInPlace();
     }).catch(() => {
       delete this._imgBusy[key];
       this._imgCache[key] = { ts: Date.now(), failed: true };
-      this._render();
+      this._refreshImageryInPlace();
     });
   }
   _docHidden() { try { return document.hidden; } catch (_) { return false; } }
@@ -2501,7 +2593,38 @@ class HurricaneCard extends HTMLElement {
       if (e.failed) { delete this._imgCache[k]; continue; }
       e.ts = 0;
     }
-    this._render();
+    this._refreshImageryInPlace();
+  }
+  /* Pass D flicker fix: the imagery 5-min heartbeat (and each completed imagery
+   * fetch) used to call _render(), which demolishes the whole shadow DOM -- map,
+   * cone, labels -- just to swap one <image> frame, so the map blinks every tick.
+   * When imagery PRESENCE is unchanged (an image is showing and still shows),
+   * patch the <image> href + the caption text in place and leave the rest of the
+   * DOM alone. Fall back to a full render only when imagery appears or disappears
+   * (source toggle, entering/leaving coverage) -- rare, and those need the
+   * surrounding layout re-solved anyway. */
+  _refreshImageryInPlace() {
+    const root = this.shadowRoot, d = this._data;
+    if (!root || !d || !d.ok || !(d.storms || []).length) { this._render(); return; }
+    const st = d.storms[this._idx] || d.storms[0];
+    const imgNode = root.querySelector(".hu-imagery");
+    const img = this._imageryState(st);   // re-resolves the source + re-arms the heartbeat
+    const want = !!(img && img.href);
+    if (want !== !!imgNode) { this._render(); return; }   // presence changed -> full rebuild
+    if (want && imgNode) imgNode.setAttribute("href", img.href);   // steady state: swap the frame in place
+    const capNode = root.querySelector(".hu-imgcap");
+    if (img && !capNode) { this._render(); return; }   // caption expected but gone -> structure moved
+    if (img && capNode) {
+      const lbl = img.layer === IMAGERY_RADAR ? "Radar" : "Satellite";
+      let sub = "", amber = false;
+      if (img.covered === false) { sub = "no coverage here"; amber = true; }
+      else if (img.failed) { sub = "unavailable"; amber = true; }
+      else if (img.loading && !img.href) { sub = "loading…"; }
+      else { sub = img.observed ? "as of " + fmtLocal(img.observed) : "live"; if (img.stale) { sub += " · last good"; amber = true; } }
+      capNode.classList.toggle("hu-amber", amber);
+      capNode.innerHTML = `<text x="12" y="20">${esc(lbl)} <tspan class="hu-imgcap-sub">${esc(sub)}</tspan></text>`
+        + (st.advisory ? `<text class="hu-imgcap-sub" x="12" y="34">NHC advisory ${esc(String(st.advisory))}</text>` : "");
+    }
   }
   /* Bound a string-keyed cache to `max` newest entries (JS preserves insertion
    * order for string keys, so the first keys are the oldest). Paired imagery +
@@ -2664,71 +2787,88 @@ class HurricaneCard extends HTMLElement {
       // layer is on), and the gear that opens the layers panel. The panel lists
       // OPTIONAL_LAYERS grouped by topic; the advisory overlay covers the whole
       // card and survives background re-renders via instance state.
-      // E5 panel: the three-way sibling sliders first (left = default sibling,
-      // middle = off, right = alternate), then the independent toggles, with
-      // advisory text LAST; a short perf note closes the panel.
+      // v0.2.7 panel order: map CONTENT first (synced viewer prefs -- the tri
+      // sliders, cone, dots, lazy layers), then the perf note closing that
+      // block, then card SHAPE last (per-device layout store) behind a visible
+      // "This device" section break. Content is what people open the gear for
+      // mid-storm; shape is set once per screen and then left alone.
       let panelRows = "", lastGroup = null;
-      // v0.2.6 Phase 2/3: card-SHAPE controls sit above the map-CONTENT sliders.
-      // Same segmented look as the tri groups, deliberately different wiring:
-      // data-lay (not data-tri) routes the click to the per-device layout store
-      // instead of the synced prefs blob. NEITHER block has a card-config master
-      // -- Phase 3 deleted show_timeline outright. Aaron's call: the card should
-      // behave consistently, one lever per thing, and both are viewer choices.
-      // ONE position control for both blocks, then a plain on/off switch each.
-      // The segments read the raw PREFERENCE (not the resolved position) so the
-      // panel shows what the user asked for even when a gate downgraded it; the
-      // note explains the downgrade. Switches reuse the .hu-sw row markup from
-      // the layer toggles but carry data-layvis, keeping them off both the
-      // synced-prefs path and the lazy-fetch path.
-      {
-        const cur = layoutPos(this._layoutPrefs);
-        const seg = (set, lbl) =>
-          `<button class="hu-seg-btn${cur === set ? " hu-sel" : ""}" data-lay="pos" data-set="${set}">${esc(lbl)}</button>`;
-        panelRows += `<div class="hu-panel-group">Info bar</div>
-          <div class="hu-seg" role="group" aria-label="Info bar position">
-            ${seg("bottom", "Bottom")}${seg("side", "Side")}
-          </div>`;
-        for (const b of LAYOUT_BLOCKS)
-          panelRows += `<label class="hu-panel-row"><span class="hu-row-lbl">${esc(b.title)}</span><input type="checkbox" class="hu-sw" data-layvis="${b.key}" ${layoutOn(this._layoutPrefs, b.key) ? "checked" : ""}/></label>`;
-        panelRows += `<div class="hu-lay-note">Side needs a wide card with a set height — otherwise it falls back to Bottom. The at-home graph only appears when a storm is forecast to reach your home. Saved on this device only.</div>`;
-      }
-      // Map pan/zoom lock: per-device (same store/key mechanism as the blocks
-      // above), plain on/off, reuses the generic data-layvis wiring below --
-      // no new load/save/listener code needed. Default ON (unchanged behavior);
-      // unchecking stops _setupPanZoom from ever attaching the gesture layer.
-      {
-        panelRows += `<div class="hu-panel-group">Map</div>
-          <label class="hu-panel-row"><span class="hu-row-lbl">Pan &amp; zoom</span><input type="checkbox" class="hu-sw" data-layvis="panZoomOn" ${layoutOn(this._layoutPrefs, "panZoomOn") ? "checked" : ""}/></label>
-          <label class="hu-panel-row"><span class="hu-row-lbl">Forecast times</span><input type="checkbox" class="hu-sw" data-layvis="trackTimes" ${layoutOn(this._layoutPrefs, "trackTimes") ? "checked" : ""}/></label>
-          <div class="hu-lay-note">Pan &amp; zoom off sends a swipe or scroll over the map to the dashboard instead of dragging it. “Forecast times” hides the day/time labels on the track — handy with imagery on. Saved on this device only.</div>`;
-      }
+      // One row builder for every switch row (five hand-copied blocks drifted
+      // apart once already). `attr` picks the wiring: data-layer rides the
+      // lazy-fetch/sync path, data-dot the client-only synced path,
+      // data-layvis the per-device layout store. `busy` puts the in-menu
+      // fetch spinner (v0.2.7) on the row's label line.
+      const spin = `<ha-icon class="hu-panel-spin" icon="mdi:loading"></ha-icon>`;
+      const swRow = (attr, val, lbl, on, dis, note, busy) =>
+        `<label class="hu-panel-row${dis ? " hu-na" : ""}"><span class="hu-row-lbl"><span class="hu-lbl-line">${esc(lbl)}${busy ? spin : ""}</span>${
+          note ? `<span class="hu-panel-note">${esc(note)}</span>` : ""}</span><input type="checkbox" class="hu-sw" ${attr}="${val}" ${
+          on && !dis ? "checked" : ""}${dis ? " disabled" : ""}/></label>`;
+      // Tri sliders (left = default sibling, middle = off, right = alternate).
+      // A fetching side (surge on the stripe group, either imagery source)
+      // spins in the group header while its layer state is {loading} -- the
+      // open panel covers the map legend where the SVG "Loading…" rows render,
+      // so the feedback has to live in here too. Cone/dots never spin: client-
+      // only re-renders, data already baked.
       for (const t of TRI_GROUPS) {
         const na = t.nhcOnly && !nhcSt;
         const v = na ? t.def : triState(prefs, t.key);
+        const busy = (t.key === "stripe" && lay.surge && lay.surge.loading)
+          || (t.key === "imagery" && lay.imagery && lay.imagery.loading);
         const seg = (set, lbl) =>
           `<button class="hu-seg-btn${v === set ? " hu-sel" : ""}" data-tri="${t.key}" data-set="${set}"${na ? " disabled" : ""}>${esc(lbl)}</button>`;
-        panelRows += `<div class="hu-panel-group">${esc(t.title)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}</div>
+        panelRows += `<div class="hu-panel-group">${esc(t.title)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}${busy ? spin : ""}</div>
           <div class="hu-seg${na ? " hu-na" : ""}" role="group" aria-label="${esc(t.title)}">
             ${seg("left", t.lLabel)}${seg("off", "Off")}${seg("right", t.rLabel)}
           </div>`;
       }
-      // Place dots: two INDEPENDENT toggles (Cities + Population can both be on),
-      // client-only re-renders -> a distinct data-dot attr keeps them off the
-      // lazy-fetch path the OPTIONAL_LAYERS checkboxes use below.
+      // Cone toggle (v0.2.7): hides the cone POLYGON only -- the draw guard in
+      // buildConeSvg; conePx math stays live. Synced like the dots (a "what I
+      // see" choice, not layout). On a GDACS storm with no cone polygon the
+      // switch changes nothing, so it stays enabled rather than gating on data.
+      panelRows += `<div class="hu-panel-group">Forecast cone</div>`
+        + swRow("data-dot", "cone", "Show cone", prefs.coneOn !== false, false);
+      // Place dots: two INDEPENDENT toggles (Cities + Population can both be
+      // on), client-only re-renders -> data-dot keeps them off the lazy-fetch
+      // path. show_cities=false is the dashboard admin's master: rows disable.
       {
         const dna = cfg.show_cities === false;
-        const dotRow = (id, lbl, on) =>
-          `<label class="hu-panel-row${dna ? " hu-na" : ""}"><span class="hu-row-lbl">${esc(lbl)}</span><input type="checkbox" class="hu-sw" data-dot="${id}" ${on && !dna ? "checked" : ""}${dna ? " disabled" : ""}/></label>`;
         panelRows += `<div class="hu-panel-group">Place dots</div>`
-          + dotRow("cities", "Cities", prefs.dotsCities !== false)
-          + dotRow("population", "Population", prefs.dotsPop === true);
+          + swRow("data-dot", "cities", "Cities", prefs.dotsCities !== false, dna)
+          + swRow("data-dot", "population", "Population", prefs.dotsPop === true, dna);
       }
       for (const l of OPTIONAL_LAYERS) {
         if (l.group !== lastGroup) { panelRows += `<div class="hu-panel-group">${esc(l.group)}</div>`; lastGroup = l.group; }
         const na = l.nhcOnly && !nhcSt;
-        panelRows += `<label class="hu-panel-row${na ? " hu-na" : ""}"><span class="hu-row-lbl">${esc(l.label)}${na ? `<span class="hu-panel-note">NHC storms only</span>` : ""}</span><input type="checkbox" class="hu-sw" data-layer="${l.id}" ${prefs[l.id] && !na ? "checked" : ""}${na ? " disabled" : ""}/></label>`;
+        panelRows += swRow("data-layer", l.id, l.label, prefs[l.id] && !na, na,
+          na ? "NHC storms only" : null,
+          l.id === "models" && modelState && modelState.loading);
       }
       panelRows += `<div class="hu-panel-perf">Turn off what you don’t need — fewer layers means a faster card.</div>`;
+      // Card SHAPE (v0.2.6 layout platform), grouped behind one section break:
+      // everything below writes the per-device layout store, never the synced
+      // prefs blob -- ONE caption says so, instead of three notes repeating it.
+      // Same segmented look as the tri groups, different wiring: data-lay
+      // routes to the layout store. The position segments read the raw
+      // PREFERENCE (not the resolved position) so the panel shows what the
+      // user asked for even when a gate downgraded it; the note explains the
+      // downgrade. Pan/zoom off stops _setupPanZoom attaching the gesture
+      // layer. NEITHER block has a card-config master (show_timeline is gone).
+      {
+        const cur = layoutPos(this._layoutPrefs);
+        const seg = (set, lbl) =>
+          `<button class="hu-seg-btn${cur === set ? " hu-sel" : ""}" data-lay="pos" data-set="${set}">${esc(lbl)}</button>`;
+        panelRows += `<div class="hu-panel-sec">This device</div>
+          <div class="hu-panel-group">Info bar</div>
+          <div class="hu-seg" role="group" aria-label="Info bar position">
+            ${seg("bottom", "Bottom")}${seg("side", "Side")}
+          </div>`;
+        for (const b of LAYOUT_BLOCKS)
+          panelRows += swRow("data-layvis", b.key, b.title, layoutOn(this._layoutPrefs, b.key), false);
+        panelRows += `<div class="hu-panel-group">Map</div>`
+          + swRow("data-layvis", "panZoomOn", "Pan & zoom", layoutOn(this._layoutPrefs, "panZoomOn"), false)
+          + swRow("data-layvis", "trackTimes", "Forecast times", layoutOn(this._layoutPrefs, "trackTimes"), false);
+        panelRows += `<div class="hu-lay-note">Saved on this device only. “Side” needs a wide card with a set height — otherwise the info bar falls back to Bottom. The at-home graph only appears when a storm is forecast to reach your home. Pan &amp; zoom off sends a swipe over the map to the dashboard instead of dragging it. “Forecast times” hides the day/time labels on the track — handy with imagery on.</div>`;
+      }
       const tools = `<div class="hu-tools">
           <button class="hu-recenter" aria-label="Recenter map"><ha-icon icon="mdi:image-filter-center-focus"></ha-icon>Recenter</button>
           ${prefs.advisory ? `<button class="hu-toolbtn hu-doc" aria-label="Advisory text" title="Advisory text"><ha-icon icon="mdi:text-box-outline"></ha-icon></button>` : ""}
@@ -2805,7 +2945,8 @@ class HurricaneCard extends HTMLElement {
     // re-render paints straight into the active layout (no one-frame snap).
     const wrapCls = "hu-wrap" + (this._fillMode ? " hu-fill" : "")
       + (this._sideOn ? " hu-side" : "")
-      + (this._present.pager ? " hu-haspager" : "");
+      + (this._present.pager ? " hu-haspager" : "")
+      + ((this._layerPrefs && this._layerPrefs.coneOn === false) ? " hu-cone-off" : "");
     // The gear panel is a SCROLL container, and every toggle inside it triggers a
     // full re-render -- the innerHTML swap below destroys the element, so its
     // scrollTop reset to 0 and yanked the user back to the top mid-change (Aaron,
@@ -2864,15 +3005,25 @@ class HurricaneCard extends HTMLElement {
             if (k.startsWith(id + "|") && this._layerCache[k].failed) delete this._layerCache[k];
         this._render();
       }));
-    // Place-dot toggles (Cities / Population): client-only re-render, no fetch.
+    // Client-only synced toggles (Cities / Population / cone): re-render only,
+    // no fetch -- the data is already baked into the payload.
     this.shadowRoot.querySelectorAll("input[data-dot]").forEach((el) =>
       el.addEventListener("change", () => {
-        const key = el.getAttribute("data-dot") === "cities" ? "dotsCities" : "dotsPop";
+        const a = el.getAttribute("data-dot");
+        const key = a === "cities" ? "dotsCities" : a === "population" ? "dotsPop" : "coneOn";
         this._layerPrefs = this._layerPrefs || {};
         this._layerPrefs[key] = el.checked;
         saveLayerPrefs(this._layerPrefs);
         this._pushPrefs();   // sync to the user's other devices
-        this._render();
+        // Cone show/hide is pure polygon visibility -- labels, dots, keep-outs and
+        // the pop count are all identical either way -- so flip the root class in
+        // place instead of rebuilding the whole card (which blinked every label).
+        if (a === "cone") {
+          const wrap = this.shadowRoot.querySelector(".hu-wrap");
+          if (wrap) wrap.classList.toggle("hu-cone-off", !el.checked);
+        } else {
+          this._render();
+        }
       }));
     // E5 tri-group segmented buttons (Material 3 pattern: one segment per
     // state, selected segment filled -- "Off" is its own labeled segment).

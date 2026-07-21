@@ -253,25 +253,39 @@ def _dp(pts, tol):
     return [pts[i] for i, k in enumerate(keep) if k]
 
 
-def simplify_rings(rings, tol, budget=None):
+def simplify_rings(rings, tol, budget=None, keep_small=0):
     """DP-simplify a list of [[lng, lat], ...] rings (degrees). Drops rings that
     degenerate below 4 points. If `budget` is set and the total point count is
     over it, the tolerance coarsens (tol *= 1.7, same backoff as the zoom clip)
     and the pass re-runs -- a hard bound so an on-demand layer (E5 surge /
-    wind-history rings) can never blow up a websocket payload."""
+    wind-history rings) can never blow up a websocket payload.
+
+    v0.2.7 surge rework:
+    - tol=0 keeps every point unless the budget forces coarsening (escalation
+      then starts from 0.002 deg). The caller's source may already be
+      server-generalized (maxAllowableOffset), and stacking a second always-on
+      DP pass on top deleted small rings and inland fingers.
+    - keep_small > 0 exempts rings with at most that many points from DP: a
+      small ring is exactly the one a coarse tolerance degenerates below 4
+      points and silently drops, and keeping it whole is nearly free. If a
+      layer is ALL small rings the budget can't shrink them -- the loop exits
+      after 8 passes slightly over, same bound as before."""
     if not rings:
         return []
     for _ in range(8):
         out = []
         total = 0
         for r in rings:
-            s = _dp([tuple(p) for p in r], tol)
+            if (keep_small and len(r) <= keep_small) or tol <= 0:
+                s = [tuple(p) for p in r]
+            else:
+                s = _dp([tuple(p) for p in r], tol)
             if len(s) >= 4:
                 out.append([[round(x, 4), round(y, 4)] for x, y in s])
                 total += len(s)
         if budget is None or total <= budget or not out:
             return out
-        tol *= 1.7
+        tol = tol * 1.7 if tol > 0 else 0.002
     return out
 
 

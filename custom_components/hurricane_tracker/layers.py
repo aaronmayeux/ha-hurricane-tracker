@@ -23,8 +23,9 @@ import re
 
 from . import geometry, nhc
 from .const import (
-    SURGE_OFFSET_DEG,
+    SURGE_BAND_FLOOR,
     SURGE_POINT_BUDGET,
+    SURGE_RING_KEEP,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,18 +110,23 @@ def _surge_result(meta):
     feats = nhc.fetch_peak_surge(meta.get("lat"), meta.get("lng"))
     if not feats:
         return None
-    # Budget is shared across the whole layer: simplify per band against the
-    # remaining allowance so one sprawling band can't starve the rest entirely.
+    # v0.2.7 surge rework: the budget is allocated ACROSS bands proportional
+    # to raw size (with a floor so small bands always survive), never spent
+    # front-to-back -- the old running `remaining` + hard break dropped every
+    # band after the budget ran out, which read on glass as missing coverage.
+    # tol=0: the server already generalized (maxAllowableOffset); a second
+    # always-on DP pass here deleted small rings and inland fingers, so the
+    # client only coarsens a band that overruns its own allocation.
+    sized = [(ft, sum(len(r) for r in ft["rings"])) for ft in feats]
+    sized = [(ft, n) for ft, n in sized if n]
+    raw_total = sum(n for _, n in sized) or 1
     bands = []
-    remaining = SURGE_POINT_BUDGET
-    for ft in feats:
-        if remaining <= 0:
-            break
-        rings = geometry.simplify_rings(ft["rings"], SURGE_OFFSET_DEG,
-                                        budget=remaining)
+    for ft, n in sized:
+        share = max(SURGE_BAND_FLOOR, SURGE_POINT_BUDGET * n // raw_total)
+        rings = geometry.simplify_rings(ft["rings"], 0, budget=share,
+                                        keep_small=SURGE_RING_KEEP)
         if not rings:
             continue
-        remaining -= sum(len(r) for r in rings)
         bands.append({"label": ft["name"], "sym": ft["sym"], "rings": rings})
     if not bands:
         return None
@@ -135,9 +141,14 @@ def _surge_result(meta):
                 rank = _surge_rank(ft["sym"])
                 if rank > at_rank:
                     at_home, at_rank = ft["name"], rank
+    # v0.2.7: atHomeSev is the severity INDEX (0=blue .. 4=purple) so the card
+    # can name the depth from the service legend instead of showing atHome --
+    # the feature `name`, which is a bay/reach place label. atHome still rides
+    # along as the fallback for mixed-version card/server pairs.
     return {"ok": True, "layer": LAYER_SURGE,
             "advisory": str(meta.get("advisory") or ""),
-            "bands": bands, "atHome": at_home}
+            "bands": bands, "atHome": at_home,
+            "atHomeSev": at_rank if at_rank >= 0 else None}
 
 
 def _build_result(layer, storm_id, meta):

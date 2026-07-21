@@ -167,7 +167,9 @@ SURGE_URL = ("https://mapservices.weather.noaa.gov/tropical/rest/services/"
 SURGE_POLY_LAYER = 2
 SURGE_ENVELOPE_DEG = 12.0     # +/- degrees around the current position (spatial filter)
 SURGE_OFFSET_DEG = 0.005      # server-side generalization (maxAllowableOffset, degrees)
-SURGE_POINT_BUDGET = 6000     # client-side DP cap across all returned rings
+SURGE_POINT_BUDGET = 6000     # point cap ACROSS bands, allocated proportionally
+SURGE_BAND_FLOOR = 400        # min point allocation per band (small bands survive)
+SURGE_RING_KEEP = 16          # rings at/under this many points bypass DP entirely
 # --- watch/warning coast tracing --------------------------------------------
 # NHC's _ww_wwlin is a BREAKPOINT list, not a coastline: the whole Florida
 # Panhandle TWA arrives as 7 vertices joined by straight chords, so the drawn

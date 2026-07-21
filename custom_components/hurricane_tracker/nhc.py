@@ -916,9 +916,27 @@ def fetch_model_tracks(storm_id, cur=None, motion_dir=None):
 # platform (layers.py) catches and soft-fails to an honest "unavailable".
 # Both UNVALIDATED against a live NHC storm (written to the probed schema);
 # on the first-live-storm validation list with Phases 3/4.
-def _esri_rings(feat):
+def _ring_is_hole(pts):
+    """Esri JSON convention: exterior rings wind CLOCKWISE, hole rings wind
+    counter-clockwise. Shoelace signed area in lon/lat (y up): CCW -> positive.
+    The wrap term makes this correct whether or not the ring repeats its first
+    point (a repeated point contributes zero)."""
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return s > 0
+
+
+def _esri_rings(feat, drop_holes=False):
     """One ArcGIS polygon feature -> list of rings, each [[lng, lat], ...].
-    Assumes outSR=4326 was requested (coords arrive as lon/lat degrees)."""
+    Assumes outSR=4326 was requested (coords arrive as lon/lat degrees).
+    drop_holes=True discards interior (counter-clockwise) rings -- v0.2.7
+    surge paint: every pocket of high ground punched a hole in the fill,
+    which read as splattered paint at card scale. Painting over the holes is
+    generalization, not deception, at this zoom."""
     rings = ((feat or {}).get("geometry") or {}).get("rings") or []
     out = []
     for r in rings:
@@ -927,6 +945,13 @@ def _esri_rings(feat):
         pts = [p for p in pts if p[0] is not None and p[1] is not None]
         if len(pts) >= 4:   # esri rings repeat the first point; <4 is degenerate
             out.append(pts)
+    if drop_holes and out:
+        kept = [r for r in out if not _ring_is_hole(r)]
+        # Orientation-surprise guard: if the server winds rings opposite to
+        # the Esri convention, EVERY ring looks like a hole. Keep the original
+        # set rather than silently returning nothing (a vanished surge layer
+        # would read as an all-clear).
+        out = kept or out
     return out
 
 
@@ -955,7 +980,7 @@ def fetch_peak_surge(lat, lng):
     out = []
     for ft in data.get("features") or []:
         a = ft.get("attributes") or {}
-        rings = _esri_rings(ft)
+        rings = _esri_rings(ft, drop_holes=True)
         if not rings:
             continue
         name = a.get("name") or a.get("NAME") or ""
