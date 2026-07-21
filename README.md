@@ -28,7 +28,12 @@ you automatically — no manual dashboard resource to add.
 - Map overlays: region/country labels, an off-screen home marker that points
   toward home when it's outside the frame, and a far-offshore mileage scale.
 - **Pan and zoom** — drag, pinch, or scroll to explore around the storm;
-  a Recenter button restores the default frame.
+  a Recenter button restores the default frame, or lock the map from the gear
+  menu to keep it put.
+- **Live weather imagery** — optionally draw GOES-East satellite (color-enhanced
+  infrared) or U.S. radar under the cone, fetched on demand from the gear menu.
+  Satellite covers the Atlantic and eastern Pacific; radar covers the U.S.;
+  elsewhere the card shows a brief "no coverage" note.
 - **Fits your dashboard automatically** — in a sections view the card
   drag-resizes like any other and fills whatever size you give it (panel views
   too). Wide, short cards move the storm info into a right-hand side column
@@ -130,15 +135,18 @@ show_scale: false
 | `show_scale` | Far-offshore mileage scale (only appears when home is off-frame). |
 | `show_home` | Home marker. |
 | `show_winds` | Wind-field wash under the cone (Atlantic/Pacific storms only). |
-| `show_timeline` | At-home wind timeline below the map (only appears when forecast winds reach home). |
 | `smooth` | Smooth (curved) coastlines vs. straight segments. |
 
 ### Map layers (gear menu on the card)
 
-The gear button on the map opens per-viewer layer settings. Choices are sticky
-per browser, and on-demand layers fetch their data **only when switched on** —
-they never add to the integration's background polling, so the baseline card
-stays cheap on low-end hardware. Tapping anywhere outside the panel closes it.
+The gear button on the map opens per-viewer layer settings. Your layer choices
+**sync across your devices** — the same Home Assistant login shows the same
+layers on a phone and a wall tablet, and flipping one pushes live to the others.
+On-demand layers fetch their data **only when switched on**, so they never add to
+the integration's background polling and the baseline card stays cheap on
+low-end hardware. (Where each block *sits* — the data bar and the at-home wind
+graph — is remembered per device instead, since that depends on the screen.)
+Tapping anywhere outside the panel closes it.
 
 **Three-way toggles** — sibling pairs that would fight for the same map space,
 so one draws at a time (left = default, middle = off, right = the alternate):
@@ -148,6 +156,7 @@ so one draws at a time (left = default, middle = off, right = the alternate):
 | Wind field | Current-position 34/50/64 kt field | Full-track wind swath | `show_winds` card config is the master on/off. |
 | Place dots | City dots + names (top places) | Population density — the mapped places in view, dot size scaled by population, fading with distance from the projected path; adds a "~X people in the cone" line to the data bar (mapped places with population ≥ 5,000 only, so it's an undercount) | `show_cities` card config is the master on/off. |
 | Coastal stripe | Watch/warning segments | Peak storm surge inundation bands + "surge at home" (fetched on demand) | Atlantic/East Pacific/Central Pacific storms only. |
+| Imagery | Satellite (GOES-East color-enhanced IR) | Radar (NOAA MRMS reflectivity) | **Off by default** (center). Drawn under the cone, fetched on demand. Satellite covers the Atlantic/eastern Pacific; radar the U.S.; elsewhere a "no coverage" note. |
 
 **On-demand layers:**
 
@@ -315,8 +324,12 @@ attributes carry GDACS's own official alert data — absent on NHC storms:
   town points (names, positions, populations) from the
   [GeoNames](https://www.geonames.org/) cities5000 dataset, licensed under
   [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- **Weather imagery** (optional, on demand) — satellite from the
+  [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/) GOES-East
+  service; radar from [NOAA nowCOAST](https://nowcoast.noaa.gov/) (MRMS). Both
+  public domain, and fetched only when you turn the imagery layer on.
 
-Sources are polled every 30 minutes. This project is not affiliated with or
+Storm sources are polled every 30 minutes. This project is not affiliated with or
 endorsed by NOAA/NHC, GDACS, the European Commission, Natural Earth, or
 GeoNames.
 
