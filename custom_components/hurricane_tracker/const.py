@@ -273,3 +273,53 @@ SERVICE_SET_OPTIONS = "set_options"
 # Service field names == the option keys they write, so the service payload is
 # just a subset of the options dict. (basin/storm_filter/range/units/off_season
 # are already defined above as CONF_* / values.)
+
+# --- weather imagery overlay (§13, on-demand raster underlay) ----------------
+# Draw live weather imagery UNDER the cone. Two PUBLIC-DOMAIN EPSG:3857 PNG
+# sources; satellite LEADS (covers open ocean where storms live), radar is a
+# near-land bonus. Fetched stdlib-only (urllib) as raw bytes, cached in a
+# bounded in-memory LRU, and handed to the card as a SIGNED HTTP path -- NEVER
+# over the websocket (no binary bloat). The black-sky knockout is a client SVG
+# filter; the backend never touches pixels, so requirements[] stays empty.
+IMAGERY_SAT = "imagery_sat"
+IMAGERY_RADAR = "imagery_radar"
+IMAGERY_LAYERS = {IMAGERY_SAT, IMAGERY_RADAR}
+
+# Satellite: IEM GOES-East Band 13 (Clean LWIR, color-enhanced). WMS 1.1.1
+# GetMap. Clear sky renders SOLID BLACK (not alpha) -- the card's
+# #extract-clouds filter knocks the black out. MUST be PNG, not JPEG: JPEG
+# mosquito-noise near black keys as colored halos.
+IMAGERY_SAT_URL = "https://mesonet.agron.iastate.edu/cgi-bin/wms/goes_east.cgi"
+IMAGERY_SAT_LAYER = "conus_ch13"
+# Radar: NOAA nowCOAST MRMS base reflectivity ImageServer (exportImage). 5-min
+# updates; CONUS + Caribbean + AK/HI/Guam. True transparent PNG.
+IMAGERY_RADAR_URL = ("https://mapservices.weather.noaa.gov/eventdriven/rest/"
+                     "services/radar/radar_base_reflectivity_time/ImageServer")
+
+# Refresh cadence == source cadence (5 min). The CARD drives the refresh; the
+# backend never self-initiates. TTL also buckets the byte-cache key.
+IMAGERY_TTL_S = 300
+# Bounded in-memory byte cache (protects the SD card): a few recent frames,
+# evicted oldest-first past the frame cap or the hard byte cap.
+IMAGERY_CACHE_MAX_FRAMES = 6
+IMAGERY_CACHE_MAX_BYTES = 8 * 1024 * 1024
+# Requested raster pixel size is derived from the 3857 bbox aspect, longest side
+# capped so one frame can't balloon the cache or the fetch.
+IMAGERY_MAX_DIM = 1800
+IMAGERY_HTTP_TIMEOUT = 20
+# Signed-path lifetime handed to the card. Comfortably longer than one refresh
+# cycle so a cached frame's URL stays valid between heartbeats.
+IMAGERY_SIGN_TTL_S = 15 * 60
+
+# EPSG:3857 (Web Mercator) sphere radius + latitude clamp, mirroring the card's
+# makeProject (x linear in lng, y through the Mercator stretch).
+MERC_R = 6378137.0
+MERC_LAT_LIMIT = 85.05112878
+
+# Coverage gates as (min_lng, min_lat, max_lng, max_lat) tested against the bbox
+# CENTER. Outside -> the card shows a "no coverage" note, not a blank raster.
+# Satellite: GOES-East reaches the Atlantic + E Pacific but NOT the GDACS basins
+# (W Pacific / Indian) or CPac west of ~140W. Radar (MRMS): CONUS + Caribbean +
+# AK/HI/Guam, i.e. the W hemisphere north of the deep tropics' south edge.
+IMAGERY_SAT_COVERAGE = (-140.0, -60.0, 10.0, 65.0)
+IMAGERY_RADAR_COVERAGE = (-170.0, 10.0, -60.0, 72.0)

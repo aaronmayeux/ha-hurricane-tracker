@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import OrderedDict
 from datetime import timedelta
 
 from homeassistant.core import HomeAssistant, callback
@@ -273,6 +274,10 @@ class HurricaneCoordinator(DataUpdateCoordinator):
         # keyed (storm_id, layer, advisory) so a new advisory misses.
         self.layer_meta = {}
         self.layer_cache = {}
+        # Imagery overlay (§13): bounded in-memory LRU of raw PNG bytes, keyed by
+        # a per-frame token. Time-bucketed + capped, so stale frames evict
+        # naturally -- no per-poll clear. The HTTP view streams bytes from here.
+        self.imagery_cache = OrderedDict()
 
     async def async_hydrate_cache(self) -> None:
         """Load the persisted bake cache from .storage into _bake_cache.

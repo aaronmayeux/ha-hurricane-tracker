@@ -15,6 +15,56 @@
 
 const WS_TYPE = "hurricane_tracker/data";
 const WS_LAYER_TYPE = "hurricane_tracker/layer";
+/* Weather-imagery overlay (§13). The Imagery tri-slider maps Satellite=left,
+ * Off=center, Radar=right; these ids ride the layer websocket with the card's
+ * bbox and come back as a signed HTTP path the <image> loads. */
+const IMAGERY_SAT = "imagery_sat";
+const IMAGERY_RADAR = "imagery_radar";
+const IMG_REFRESH_MS = 5 * 60 * 1000;   // heartbeat cadence == source cadence
+const IMG_TTL_MS = 5 * 60 * 1000;       // reuse a fetched frame this long
+const IMG_CACHE_MAX = 12;               // bound the per-instance imagery cache
+const LAYER_CACHE_MAX = 24;             // paired fix: bound _layerCache too
+/* Satellite cloud extraction (satellite ONLY -- radar is already a transparent
+ * PNG). GOES Band 13 color-enhanced renders the COLD storm tops in vivid color
+ * and warm/low cloud in GRAYSCALE, so we key on SATURATION (chroma), not
+ * brightness: a bright gray pixel is dropped, a colored one kept. Chroma =
+ * |channel - luma| summed over RGB (a feBlend 'difference' against a grayscale
+ * copy -- premultiplied-alpha-safe, unlike an arithmetic subtract which zeroes
+ * the intermediate alpha and wipes the color); alpha = SLOPE*chroma + INTERCEPT.
+ * Unlike a brightness key, the two knobs are independent of how BRIGHT the cloud
+ * is -- they set WHERE on the gray->color axis the cutoff sits.
+ *   IMG_SAT_INTERCEPT (cutoff): more negative -> higher cutoff -> more gray /
+ *     faint color removed. Cutoff sits at -INTERCEPT/SLOPE of full chroma.
+ *   IMG_SAT_SLOPE (sharpness): higher -> a colored pixel ramps to full opacity
+ *     faster once past the cutoff (crisper edge); lower -> softer fade.
+ * sRGB is load-bearing (linearRGB mis-tunes it). DO NOT LOSE THIS. */
+const IMG_SAT_SLOPE = 4;
+const IMG_SAT_INTERCEPT = -0.5;
+/* Edge fade: the palette's COLD-edge band renders blue/purple, which sits at
+ * full opacity like the hot cores and reads as overpowering. Scale a pixel's
+ * alpha by (1 - IMG_EDGE_FADE * blue): purple/blue (high blue) fades, while the
+ * green/yellow/orange/red cores (low blue) stay full. 0 = off; higher = more
+ * fade. Multiplied onto the saturation mask, so it only ever REMOVES opacity. */
+const IMG_EDGE_FADE = 0.5;
+/* Purple-only fade, stacked ON TOP of the blue edge fade. Purple/magenta is the
+ * only band with BOTH red and blue high, so red*blue is a magenta detector:
+ * pure blue (red ~0) and the red/green/orange cores (blue ~0) are untouched,
+ * only purple is hit. Scale alpha by (1 - IMG_PURPLE_FADE * red*blue). 0 = off;
+ * higher = more purple fade. */
+const IMG_PURPLE_FADE = 0.5;
+const IMAGERY_DEFS = `<defs><filter id="extract-clouds" color-interpolation-filters="sRGB">`
+  + `<feColorMatrix type="matrix" in="SourceGraphic" result="huGray" values="0.333 0.333 0.333 0 0  0.333 0.333 0.333 0 0  0.333 0.333 0.333 0 0  0 0 0 1 0"/>`
+  + `<feBlend in="SourceGraphic" in2="huGray" mode="difference" result="huChroma"/>`
+  + `<feColorMatrix in="huChroma" type="matrix" result="huMask" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  ${IMG_SAT_SLOPE} ${IMG_SAT_SLOPE} ${IMG_SAT_SLOPE} 0 ${IMG_SAT_INTERCEPT}"/>`
+  + `<feColorMatrix in="SourceGraphic" type="matrix" result="huEdge" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 ${-IMG_EDGE_FADE} 0 1"/>`
+  + `<feColorMatrix in="SourceGraphic" type="matrix" result="huRed" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  1 0 0 0 0"/>`
+  + `<feColorMatrix in="SourceGraphic" type="matrix" result="huBlue" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 1 0 0"/>`
+  + `<feComposite in="huRed" in2="huBlue" operator="arithmetic" k1="1" k2="0" k3="0" k4="0" result="huRB"/>`
+  + `<feColorMatrix in="huRB" type="matrix" result="huPurple" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 ${-IMG_PURPLE_FADE} 1"/>`
+  + `<feComposite in="huMask" in2="huEdge" operator="arithmetic" k1="1" k2="0" k3="0" k4="0" result="huM1"/>`
+  + `<feComposite in="huM1" in2="huPurple" operator="arithmetic" k1="1" k2="0" k3="0" k4="0" result="huMask2"/>`
+  + `<feComposite in="SourceGraphic" in2="huMask2" operator="in"/>`
+  + `</filter></defs>`;
 const REFRESH_MS = 5 * 60 * 1000;   // re-pull at most every 5 min (coordinator polls every 30)
 const VBW = 800, VBH = 600;
 /* Hard floor for the side rail (v0.2.6 Phase 2 keeps this from the Pass 3
@@ -82,6 +132,7 @@ const OPTIONAL_LAYERS = [
 const TRI_GROUPS = [
   { key: "wind",   title: "Wind field",     lLabel: "Current",    rLabel: "Swath",      def: "left", master: "show_winds" },
   { key: "stripe", title: "Coastal hazard",  lLabel: "Wind",       rLabel: "Surge",      def: "left", nhcOnly: true },
+  { key: "imagery", title: "Imagery",       lLabel: "Satellite",  rLabel: "Radar",      def: "off" },
 ];
 function triState(prefs, key) {
   const g = TRI_GROUPS.find((t) => t.key === key);
@@ -1063,7 +1114,7 @@ function scaleAxes(bbox, proj, geo, boxes, conePx, blockPts) {
 }
 
 /* ---- build the SVG from one baked storm payload --------------------------- */
-function buildConeSvg(st, cfg, models, prefs, lay) {
+function buildConeSvg(st, cfg, models, prefs, lay, layoutPrefs) {
   prefs = prefs || {};
   lay = lay || {};
   // E5 three-way sibling groups, resolved once per build. Card-config masters
@@ -1080,6 +1131,49 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   const triStripe = nhcStorm ? triState(prefs, "stripe") : "left";
   const proj = makeProject(st.bbox);
   const conePx = (st.cone || []).map((c) => proj(c[0], c[1]));
+  // Weather imagery underlay (§13): a raster placed FIRST in hu-pan (under the
+  // basemap) so it pans/zooms with the single hu-pan transform. Registered by
+  // the SAME Web-Mercator projection: top-left at proj(minLng,maxLat), spanning
+  // to proj(maxLng,minLat), stretched (preserveAspectRatio=none) to the rect --
+  // both the source (EPSG:3857) and makeProject are linear in (lng, mercY), so
+  // it lands square. The signed href is same-origin (HA proxies the bytes), so
+  // the black-knockout filter applies without cross-origin taint.
+  const imageryEls = [], imgCap = [];
+  {
+    const img = lay && lay.imagery;
+    if (img) {
+      if (img.href) {
+        // Cover the SAME buffered extent as the baked land/coast (st.viewBox),
+        // not just the default frame, so imagery fills the map as you pan/zoom.
+        const bb = (st.viewBox && st.viewBox.length === 4) ? st.viewBox : st.bbox;
+        const [ix0, iy0] = proj(bb[0], bb[3]);
+        const [ix1, iy1] = proj(bb[2], bb[1]);
+        // Radar is already a transparent PNG -> no filter. Satellite gets the
+        // saturation knockout (drops the grayscale warm/low cloud).
+        const filt = img.layer === IMAGERY_SAT ? ` filter="url(#extract-clouds)"` : "";
+        imageryEls.push(
+          `<image class="hu-imagery" href="${esc(img.href)}" x="${ix0.toFixed(1)}" y="${iy0.toFixed(1)}"`
+          + ` width="${(ix1 - ix0).toFixed(1)}" height="${(iy1 - iy0).toFixed(1)}"`
+          + ` preserveAspectRatio="none"${filt}/>`);
+      }
+      // Screen-space caption: imagery observed-time (fetch-time for satellite --
+      // the WMS carries none) + the NHC advisory it sits under, so the viewer
+      // reads the imagery as observed weather, fresher than the forecast cone.
+      const lbl = img.layer === IMAGERY_RADAR ? "Radar" : "Satellite";
+      let sub = "", amber = false;
+      if (img.covered === false) { sub = "no coverage here"; amber = true; }
+      else if (img.failed) { sub = "unavailable"; amber = true; }
+      else if (img.loading && !img.href) { sub = "loading…"; }
+      else {
+        sub = img.observed ? "as of " + fmtLocal(img.observed) : "live";
+        if (img.stale) { sub += " · last good"; amber = true; }
+      }
+      imgCap.push(`<g class="hu-imgcap${amber ? " hu-amber" : ""}">`
+        + `<text x="12" y="20">${esc(lbl)} <tspan class="hu-imgcap-sub">${esc(sub)}</tspan></text>`
+        + (st.advisory ? `<text class="hu-imgcap-sub" x="12" y="34">NHC advisory ${esc(String(st.advisory))}</text>` : "")
+        + `</g>`);
+    }
+  }
   const smooth = cfg.smooth !== false;
   const base = [];
   if (cfg.show_land !== false)
@@ -1299,6 +1393,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   const trackPts = [];
   for (const seg of [st.fcstTrack, st.pastTrack])
     if (seg && seg.length > 1) trackPts.push(...samplePoly(projectPart(proj, seg), 5));
+  if (layoutOn(layoutPrefs, "trackTimes"))
   placeLabels(labelJobs, { boxes: labelBlockers, trackPts }).forEach((L) => {
     // Spoke label: the text starts R_OUT from the dot and radiates outward, so
     // it reads as pointing back at its dot. Rotation about the group origin is
@@ -1549,7 +1644,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // maxScale ride as data-attrs so the gesture layer can read the pannable extent
   // + zoom ceiling off the DOM. Returns {svg, ctx}: the card stashes ctx for the
   // engine's re-runs.
-  const panGroup = [...base, ...windLayer, ...surgeLayer, ...gridDots,
+  const panGroup = [...imageryEls, ...base, ...windLayer, ...surgeLayer, ...gridDots,
     `<g class="hu-zl-cities">${zl0.cities}</g>`, ...storm,
     `<g class="hu-zl-regions">${zl0.regions}</g>`];
   // Screen-space furniture re-anchors to the VISIBLE edges (._fitOverlays):
@@ -1559,7 +1654,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // wraps its own two per-axis groups; the in-frame home glyph gets no anchor.
   const anchG = (a, parts) => (a && parts.length)
     ? [`<g class="hu-anch" data-anch="${a}">${parts.join("")}</g>`] : parts;
-  const overlayGroup = [...scale, ...anchG(homeAnch, homeParts), ...anchG("bl", mlegend), ...anchG("br", slegend)];
+  const overlayGroup = [...scale, ...anchG(homeAnch, homeParts), ...anchG("bl", mlegend), ...anchG("br", slegend), ...anchG("tl", imgCap)];
   const vb = st.viewBox ? st.viewBox.join(" ") : "";
   const ms = st.maxScale != null ? st.maxScale : 1;
   // NO frame clip on the geographic layer: in fill mode (Pass 3) the
@@ -1575,6 +1670,7 @@ function buildConeSvg(st, cfg, models, prefs, lay) {
   // visible edges via the data-anch groups + _fitOverlays.
   const svg = `<svg class="hu-svg" viewBox="0 0 ${VBW} ${VBH}" preserveAspectRatio="xMidYMid meet"`
     + ` data-viewbox="${vb}" data-maxscale="${ms}" data-bbox="${(st.bbox || []).join(" ")}" xmlns="http://www.w3.org/2000/svg">`
+    + IMAGERY_DEFS
     + `<g class="hu-pan">${panGroup.join("")}</g>`
     + `<g class="hu-overlays">${overlayGroup.join("")}</g>`
     + `</svg>`;
@@ -2059,6 +2155,10 @@ const STYLE = `
   .hu-msg .hu-msg-title { font-size: 18px; font-weight: 700; color: var(--primary-text-color); margin-top: 8px; }
   .hu-msg .hu-msg-sub { font-size: 14px; margin-top: 4px; }
   .hu-stale { font-size: 12px; color: var(--warning-color, #d68b00); padding: 0 14px 10px; }
+  .hu-imgcap text { font: 600 11px/1.2 sans-serif; fill: #fff; paint-order: stroke;
+    stroke: rgba(0,0,0,.6); stroke-width: 2.5px; stroke-linejoin: round; }
+  .hu-imgcap .hu-imgcap-sub { font-weight: 400; }
+  .hu-imgcap.hu-amber text { fill: var(--warning-color, #d68b00); }
 
   .hu-pager button { border: none; background: var(--secondary-background-color); color: var(--primary-text-color);
                      border-radius: 50%; width: 30px; height: 30px; font-size: 16px; cursor: pointer; }
@@ -2075,6 +2175,9 @@ class HurricaneCard extends HTMLElement {
     this._layerPrefs = loadLayerPrefs(); this._panelOpen = false; this._panelScroll = 0;
     this._advOpen = false; this._advTitle = ""; this._advBody = ""; this._layerCache = {};
     this._layerBusy = {};   // in-flight layer fetches, keyed like _layerCache
+    // Imagery overlay (§13): per-instance frame cache + in-flight guard, the
+    // active imagery layer, and the refresh-heartbeat timer id.
+    this._imgCache = {}; this._imgBusy = {}; this._imgActive = null; this._imgTimer = 0;
     // Layout POSITION prefs (v0.2.6 Phase 2): per-device, own store, never
     // synced. Kept separate from _layerPrefs on purpose -- see LAYOUT_STORE_KEY.
     this._layoutPrefs = loadLayoutPrefs();
@@ -2160,13 +2263,24 @@ class HurricaneCard extends HTMLElement {
       };
       document.addEventListener("click", this._docClose, true);
     }
+    // Imagery heartbeat gating: pause on tab-hidden, resume (and refresh a stale
+    // frame) on return. _syncImageryHeartbeat also re-checks isConnected.
+    if (!this._visHandler) {
+      this._visHandler = () => {
+        this._syncImageryHeartbeat();
+        if (!this._docHidden() && this._imgActive) this._imageryTick();
+      };
+      document.addEventListener("visibilitychange", this._visHandler);
+    }
   }
   disconnectedCallback() {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._imgTimer) { clearInterval(this._imgTimer); this._imgTimer = 0; }
     if (this._ro) { this._ro.disconnect(); this._ro = null; }
     if (this._layoutRaf) { cancelAnimationFrame(this._layoutRaf); this._layoutRaf = 0; }
     if (this._deferT) { clearTimeout(this._deferT); this._deferT = 0; }
     if (this._docClose) { document.removeEventListener("click", this._docClose, true); this._docClose = null; }
+    if (this._visHandler) { document.removeEventListener("visibilitychange", this._visHandler); this._visHandler = null; }
     if (this._prefsUnsub) { this._prefsUnsub(); this._prefsUnsub = null; }
     this._prefsSubStarted = false;
   }
@@ -2270,6 +2384,7 @@ class HurricaneCard extends HTMLElement {
       if (!this._advOpen) return;   // closed while loading
       if (res && res.ok && res.text) {
         this._layerCache[key] = res;
+        this._capCache(this._layerCache, LAYER_CACHE_MAX);
         this._advTitle = res.title || this._advTitle;
         this._advBody = `<div class="hu-adv-text">${esc(res.text)}</div>`;
       } else {
@@ -2294,10 +2409,12 @@ class HurricaneCard extends HTMLElement {
     this._hass.callWS({ type: WS_LAYER_TYPE, storm_id: sid, layer }).then((res) => {
       delete this._layerBusy[key];
       this._layerCache[key] = (res && res.ok) ? res : { failed: true };
+      this._capCache(this._layerCache, LAYER_CACHE_MAX);
       this._render();
     }).catch(() => {
       delete this._layerBusy[key];
       this._layerCache[key] = { failed: true };
+      this._capCache(this._layerCache, LAYER_CACHE_MAX);
       this._render();
     });
   }
@@ -2313,6 +2430,88 @@ class HurricaneCard extends HTMLElement {
     return { loading: true };
   }
 
+  /* --- imagery overlay (§13) ------------------------------------------------
+   * A time-sensitive raster, so it does NOT ride the per-advisory _layerCache:
+   * its own frame cache is keyed by (layer, storm, advisory, bbox) and expires
+   * on the TTL, and a heartbeat refetches while imagery is on AND the card is
+   * visible. Fetch is over the layer websocket (bytes come back as a signed
+   * HTTP path, not inline), soft-failing to an honest note. */
+  /* Imagery frames cover the buffered extent (st.viewBox) so they fill the map
+   * on pan/zoom, matching the baked coast; fall back to the default frame on an
+   * older payload. The card sends THIS bbox and draws over it -- they must match. */
+  _imageryBbox(st) {
+    return (st && st.viewBox && st.viewBox.length === 4) ? st.viewBox : ((st && st.bbox) || []);
+  }
+  _imageryKey(layer, st) {
+    return `${layer}|${st.stormId || ""}|${st.advisory || ""}|${this._imageryBbox(st).map((n) => (+n).toFixed(2)).join(",")}`;
+  }
+  _imageryState(st) {
+    const tri = triState(this._layerPrefs || {}, "imagery");
+    const layer = tri === "left" ? IMAGERY_SAT : tri === "right" ? IMAGERY_RADAR : null;
+    this._imgActive = layer;
+    this._syncImageryHeartbeat();
+    if (!layer || !st) return null;
+    const key = this._imageryKey(layer, st);
+    const c = this._imgCache[key];
+    const now = Date.now();
+    if (c && c.covered === false) return { layer, covered: false };
+    if (c && c.href && (now - c.ts) < IMG_TTL_MS)
+      return { layer, href: c.href, observed: c.observed, stale: !!c.staleFeed };
+    if (c && c.failed && (now - c.ts) < IMG_TTL_MS) return { layer, failed: true };
+    // Missing or expired -> (re)fetch; keep showing a good frame meanwhile.
+    this._fetchImagery(layer, key, st);
+    if (c && c.href) return { layer, href: c.href, observed: c.observed, stale: true };
+    return { layer, loading: true };
+  }
+  _fetchImagery(layer, key, st) {
+    if (this._imgBusy[key] || !this._hass) return;
+    this._imgBusy[key] = true;
+    this._hass.callWS({ type: WS_LAYER_TYPE, storm_id: st.stormId || "", layer, bbox: this._imageryBbox(st) }).then((res) => {
+      delete this._imgBusy[key];
+      if (res && res.ok && res.href)
+        this._imgCache[key] = { ts: Date.now(), href: res.href, observed: res.observed || null, staleFeed: !!res.stale, covered: true };
+      else if (res && res.ok && res.covered === false)
+        this._imgCache[key] = { ts: Date.now(), covered: false };
+      else
+        this._imgCache[key] = { ts: Date.now(), failed: true };
+      this._capCache(this._imgCache, IMG_CACHE_MAX);
+      this._render();
+    }).catch(() => {
+      delete this._imgBusy[key];
+      this._imgCache[key] = { ts: Date.now(), failed: true };
+      this._render();
+    });
+  }
+  _docHidden() { try { return document.hidden; } catch (_) { return false; } }
+  /* Start/stop the refresh heartbeat to match "imagery on AND card visible AND
+   * connected". Called from _imageryState (covers toggle + connect changes) and
+   * the visibilitychange handler. */
+  _syncImageryHeartbeat() {
+    const want = !!this._imgActive && !this._docHidden() && this.isConnected;
+    if (want && !this._imgTimer)
+      this._imgTimer = setInterval(() => this._imageryTick(), IMG_REFRESH_MS);
+    else if (!want && this._imgTimer) { clearInterval(this._imgTimer); this._imgTimer = 0; }
+  }
+  _imageryTick() {
+    // Expire good frames so the next render refetches fresh imagery; drop failed
+    // ones so a recovered feed retries. No-coverage is geographic -> leave it.
+    for (const k of Object.keys(this._imgCache)) {
+      const e = this._imgCache[k];
+      if (e.covered === false) continue;
+      if (e.failed) { delete this._imgCache[k]; continue; }
+      e.ts = 0;
+    }
+    this._render();
+  }
+  /* Bound a string-keyed cache to `max` newest entries (JS preserves insertion
+   * order for string keys, so the first keys are the oldest). Paired imagery +
+   * _layerCache discipline -- neither grows unbounded within a page session. */
+  _capCache(cache, max) {
+    const keys = Object.keys(cache);
+    if (keys.length <= max) return;
+    for (let i = 0; i < keys.length - max; i++) delete cache[keys[i]];
+  }
+
   /* Apply a tri-group change (slider or side-label tap). Re-selecting surge
    * clears its cached failures so the fetch retries fresh (models pattern). */
   _applyTri(key, v) {
@@ -2322,6 +2521,11 @@ class HurricaneCard extends HTMLElement {
     if (key === "stripe" && v === "right")
       for (const k of Object.keys(this._layerCache))
         if (k.startsWith("surge|") && this._layerCache[k].failed) delete this._layerCache[k];
+    // Re-selecting an imagery source clears its cached failures so the fetch
+    // retries fresh (same pattern as surge).
+    if (key === "imagery" && v !== "off")
+      for (const k of Object.keys(this._imgCache))
+        if (this._imgCache[k].failed) delete this._imgCache[k];
     this._render();
   }
 
@@ -2441,11 +2645,15 @@ class HurricaneCard extends HTMLElement {
       const lay = { surge: null };
       if (nhcSt && triState(prefs, "stripe") === "right")
         lay.surge = this._layerState("surge", st);
+      // Imagery underlay: resolve the active source (Sat/Radar/off) for the draw
+      // and (de)arm the refresh heartbeat. Not NHC-gated -- coverage is a
+      // per-frame geographic test inside _imageryState, not a source gate.
+      lay.imagery = this._imageryState(st);
       let svg = "", popImpact = null;
       this._labelCtx = null;   // E6: engine context, set only on a successful build
       this._scaleEmit = null;  // mileage-axis emitter, ditto (re-run per layout pass)
       try {
-        const built = buildConeSvg(st, cfg, modelState, prefs, lay);
+        const built = buildConeSvg(st, cfg, modelState, prefs, lay, this._layoutPrefs);
         svg = built.svg;
         this._labelCtx = built.ctx;
         this._scaleEmit = built.scaleEmit;
@@ -2491,7 +2699,8 @@ class HurricaneCard extends HTMLElement {
       {
         panelRows += `<div class="hu-panel-group">Map</div>
           <label class="hu-panel-row"><span class="hu-row-lbl">Pan &amp; zoom</span><input type="checkbox" class="hu-sw" data-layvis="panZoomOn" ${layoutOn(this._layoutPrefs, "panZoomOn") ? "checked" : ""}/></label>
-          <div class="hu-lay-note">Turn off so a swipe or scroll over the map doesn’t drag it — the gesture goes to the dashboard instead. Saved on this device only.</div>`;
+          <label class="hu-panel-row"><span class="hu-row-lbl">Forecast times</span><input type="checkbox" class="hu-sw" data-layvis="trackTimes" ${layoutOn(this._layoutPrefs, "trackTimes") ? "checked" : ""}/></label>
+          <div class="hu-lay-note">Pan &amp; zoom off sends a swipe or scroll over the map to the dashboard instead of dragging it. “Forecast times” hides the day/time labels on the track — handy with imagery on. Saved on this device only.</div>`;
       }
       for (const t of TRI_GROUPS) {
         const na = t.nhcOnly && !nhcSt;

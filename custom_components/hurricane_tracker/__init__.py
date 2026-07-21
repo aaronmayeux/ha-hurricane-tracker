@@ -28,11 +28,12 @@ from .const import (
     DOMAIN,
     FILTERS,
     FRONTEND_URL_BASE,
+    IMAGERY_LAYERS,
     OFF_SEASON,
     SERVICE_SET_OPTIONS,
     UNITS,
 )
-from . import layers
+from . import imagery, layers
 from .coordinator import HurricaneCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # `custom:hurricane-card` instead of erroring. Both are idempotent.
     await _async_register_frontend(hass)
     _register_ws(hass)
+    _register_imagery_view(hass)
     _register_services(hass)
 
     coordinator = HurricaneCoordinator(hass, entry)
@@ -163,6 +165,27 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Imagery overlay (§13): an HTTP view streams cached raster PNG bytes to the
+# card's <image> tag. The bytes ride HTTP (not the websocket), authenticated by
+# the signed query param the layer websocket hands back. Registered once,
+# entry-agnostic; the getter resolves the single coordinator's byte cache lazily
+# at request time (the view is registered before the coordinator exists).
+# ---------------------------------------------------------------------------
+@callback
+def _register_imagery_view(hass: HomeAssistant) -> None:
+    if hass.data.get(f"{DOMAIN}_imagery_view"):
+        return
+    hass.data[f"{DOMAIN}_imagery_view"] = True
+
+    def _imagery_cache():
+        store = hass.data.get(DOMAIN) or {}
+        coordinator = next(iter(store.values()), None)
+        return getattr(coordinator, "imagery_cache", None)
+
+    hass.http.register_view(imagery.ImageryView(_imagery_cache))
+
+
+# ---------------------------------------------------------------------------
 # Websocket: the card pulls the heavy geometry here (authenticated, not stored
 # in the recorder like a big entity attribute would be). A second command
 # serves the on-demand optional layers (Session E): the card asks only when a
@@ -194,6 +217,10 @@ def _register_ws(hass: HomeAssistant) -> None:
         vol.Required("type"): f"{DOMAIN}/layer",
         vol.Required("storm_id"): str,
         vol.Required("layer"): str,
+        # Imagery layers carry the card's current lng/lat frame so the backend
+        # can request the raster over exactly what the card is drawing. Other
+        # layers ignore it.
+        vol.Optional("bbox"): [vol.Coerce(float)],
     })
     @websocket_api.async_response
     async def _ws_layer(hass, connection, msg):
@@ -201,8 +228,14 @@ def _register_ws(hass: HomeAssistant) -> None:
         if coordinator is None:
             connection.send_result(msg["id"], {"ok": False, "reason": "unavailable"})
             return
-        connection.send_result(msg["id"], await layers.async_get_layer(
-            hass, coordinator, msg["storm_id"], msg["layer"]))
+        layer = msg["layer"]
+        if layer in IMAGERY_LAYERS:
+            result = await imagery.async_get_imagery(
+                hass, coordinator, layer, msg.get("bbox"), msg["storm_id"])
+        else:
+            result = await layers.async_get_layer(
+                hass, coordinator, msg["storm_id"], layer)
+        connection.send_result(msg["id"], result)
 
     websocket_api.async_register_command(hass, _ws_data)
     websocket_api.async_register_command(hass, _ws_layer)
