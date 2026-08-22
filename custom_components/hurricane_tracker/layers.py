@@ -96,6 +96,16 @@ def _models_result(storm_id, meta):
         storm_id, (meta.get("lng"), meta.get("lat")), meta.get("dir"))
     if not models:
         return None
+    # Antimeridian: a-deck longitudes arrive in -180..180, but the baked payload
+    # (and therefore the card's frame) is the continuous window centered on the
+    # storm -- see geometry.unwrap_lng. Put the guidance in that same frame here,
+    # server-side, so every path agrees; the card's own normalize then no-ops.
+    # Without this, model tracks for a dateline storm run the long way round.
+    ref = meta.get("lng")
+    if ref is not None:
+        for m in models:
+            m["points"] = [[geometry.unwrap_lng(x, ref), y]
+                           for x, y in (m.get("points") or [])]
     return {"ok": True, "layer": LAYER_MODELS,
             "advisory": str(meta.get("advisory") or ""),
             "models": models}
@@ -130,6 +140,15 @@ def _surge_result(meta):
         bands.append({"label": ft["name"], "sym": ft["sym"], "rings": rings})
     if not bands:
         return None
+    # Antimeridian: same one-frame rule as the model tracks -- the DRAWN rings
+    # go into the card's continuous window. The at-home ray-cast below stays on
+    # the RAW rings against the RAW home: both are in -180..180, so that test is
+    # already self-consistent and is left alone.
+    ref = meta.get("lng")
+    if ref is not None:
+        for band in bands:
+            band["rings"] = [[[geometry.unwrap_lng(x, ref), y] for x, y in ring]
+                             for ring in band["rings"]]
     # At-home test on the RAW (pre-simplify) rings -- worst band containing
     # home wins. Uses the same ray-cast as the Phase 3 wind report.
     at_home, at_rank = None, -2

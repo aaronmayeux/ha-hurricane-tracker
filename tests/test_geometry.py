@@ -100,3 +100,76 @@ def test_assemble_payload_smoke(storm, forecast_zip, best_track_zip):
     names = {p["name"] for p in places}
     assert "Iztapalapa" not in names   # boroughs gone
     assert names & {"Los Angeles", "Mexico City", "San Diego", "Tijuana"}
+
+
+# --- antimeridian ------------------------------------------------------------
+# Regression numbers are REAL: NHC CP01 Lala, fetched live 2026-08-22. NHC
+# returned her cone ring unwrapped EAST of the dateline and her forecast/past
+# tracks wrapped WEST, in the same advisory. Raw, compute_bbox read that as a
+# storm 368 degrees wide -> [-224.035, -104.846, 232.030, 175.029], which made
+# clip_basemap decode the whole planet (the freeze) and the card draw a
+# whole-world frame (the broken map).
+LALA_LNG = -172.4
+LALA_CONE = [[177.15, 30.9], [187.89, 30.1], [182.0, 34.5], [177.15, 30.9]]
+LALA_FCST = [[-172.4, 30.5], [-176.0, 32.1], [-179.9, 33.8]]
+LALA_PAST = [[-170.5, 29.2], [-172.2, 30.4]]
+
+
+def test_unwrap_lng():
+    # already within 180 of the reference -> untouched
+    assert geometry.unwrap_lng(-100.0, -98.0) == -100.0
+    # east-unwrapped cone longitude, pulled to the storm's western frame
+    assert round(geometry.unwrap_lng(187.89, LALA_LNG), 2) == -172.11
+    assert round(geometry.unwrap_lng(177.15, LALA_LNG), 2) == -182.85
+    # idempotent
+    once = geometry.unwrap_lng(177.15, LALA_LNG)
+    assert geometry.unwrap_lng(once, LALA_LNG) == once
+    assert geometry.unwrap_lng(None, LALA_LNG) is None
+
+
+def test_world_shifts_normal_frame_is_single_pass():
+    # every frame inside -180..180 must stay exactly one pass (no extra decode)
+    assert geometry._world_shifts(-100.0, -76.0) == (0.0,)
+    assert geometry._world_shifts(-179.0, 179.0) == (0.0,)
+
+
+def test_world_shifts_wrapped_frame_adds_neighbour():
+    assert geometry._world_shifts(-201.0, -152.3) == (-360.0, 0.0)
+    assert geometry._world_shifts(160.0, 201.0) == (0.0, 360.0)
+
+
+def test_normalize_frame_joins_split_longitudes():
+    fd = {"cone": LALA_CONE, "fcstTrack": LALA_FCST, "pastTrack": LALA_PAST,
+          "points": [{"lng": 179.5, "lat": 33.0, "tau": 48}],
+          "ww": [{"type": "TW", "coords": [[178.0, 30.0]]}],
+          "windSwath": [{"kt": 34, "points": [{"lng": 178.5, "lat": 31.0}]}]}
+    out = geometry.normalize_frame(fd, LALA_LNG)
+    lngs = ([c[0] for c in out["cone"]] + [c[0] for c in out["fcstTrack"]]
+            + [c[0] for c in out["pastTrack"]])
+    assert max(lngs) - min(lngs) < 40.0
+    assert all(l < -160.0 for l in lngs)          # one frame, west of the seam
+    assert out["points"][0]["lng"] < -180.0
+    assert out["ww"][0]["coords"][0][0] < -180.0
+    assert out["windSwath"][0]["points"][0]["lng"] < -180.0
+    # source dict untouched (the coordinator caches it)
+    assert fd["cone"][0][0] == 177.15
+
+
+def test_compute_bbox_dateline_stays_storm_sized():
+    fd = geometry.normalize_frame(
+        {"cone": LALA_CONE, "fcstTrack": LALA_FCST, "pastTrack": LALA_PAST},
+        LALA_LNG)
+    bbox = geometry.compute_bbox(fd["cone"], fd["fcstTrack"], fd["pastTrack"])
+    assert bbox is not None
+    assert bbox[2] - bbox[0] < 40.0, "dateline storm framed as a world map"
+    assert bbox[3] - bbox[1] < 40.0
+    assert -90.0 <= bbox[1] and bbox[3] <= 90.0, "aspect fit ran past the poles"
+    # the frame is allowed -- and expected -- to sit outside -180..180
+    assert bbox[0] < -180.0
+
+
+def test_compute_bbox_raw_split_frame_is_the_bug():
+    """Guard the guard: without normalize_frame the raw numbers still blow up,
+    so this test can never pass for the wrong reason."""
+    bbox = geometry.compute_bbox(LALA_CONE, LALA_FCST, LALA_PAST)
+    assert bbox[2] - bbox[0] > 300.0

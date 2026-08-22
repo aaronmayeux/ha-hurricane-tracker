@@ -50,6 +50,90 @@ _MIN_PTS = {"coast": 2, "states": 2, "land": 3}
 
 
 # ---------------------------------------------------------------------------
+# Antimeridian: ONE continuous longitude frame per storm
+# ---------------------------------------------------------------------------
+# NHC does not ship a storm in a single longitude frame. Measured live on CP01
+# Lala, 2026-08-22: the cone ring came back unwrapped EAST of the dateline
+# (177.15 .. 187.89) while the forecast and past tracks came back wrapped WEST
+# (-179.90 .. -170.50). Taken raw, compute_bbox saw a storm 368 degrees wide and
+# the 4:3 aspect fit blew latitude past both poles:
+#     bbox = [-224.035, -104.846, 232.030, 175.029]
+# That one number caused BOTH reported symptoms -- clip_basemap then decoded
+# every part of the global basemap and DP-ran it (the multi-second freeze on
+# switching to the storm), and the card drew a whole-world frame with the tracks
+# running the long way round and the cone off in a different part of the world.
+#
+# The fix: pick ONE reference longitude per storm (its current position) and
+# rewrite every longitude in the payload to the equivalent value within +/-180
+# of it. The frame is then continuous, and may LEGITIMATELY sit outside
+# -180..180 -- Lala's becomes [-188.855 .. -164.497]. The basemap clip below
+# queries the neighbouring world copy to fill such a frame, and the card's
+# projection is linear in longitude so it draws it correctly.
+#
+# Do NOT "fix" a downstream symptom by clamping coordinates back into
+# -180..180. Splitting the frame is what broke it in the first place.
+def unwrap_lng(lng, ref):
+    """`lng` moved by whole turns to the copy nearest `ref`. Idempotent, and a
+    no-op when the two are already within 180 degrees (the normal case)."""
+    if lng is None or ref is None:
+        return lng
+    return ref + ((lng - ref + 180.0) % 360.0) - 180.0
+
+
+def _world_shifts(minx, maxx):
+    """The world copies a query window touches, as +/-360 offsets. Returns
+    (0.0,) for every frame that stays inside -180..180 -- i.e. every storm that
+    doesn't cross the dateline -- so the normal path is bit-for-bit unchanged."""
+    return tuple(s for s in (-360.0, 0.0, 360.0)
+                 if minx <= 180.0 + s and maxx >= -180.0 + s)
+
+
+def normalize_frame(fdata, ref):
+    """Rewrite every longitude in a parsed storm's geometry into the single
+    continuous frame centered on `ref` (the storm's current longitude).
+
+    Called ONCE, at the top of assemble_payload, so everything downstream --
+    compute_bbox, the corridor/swath builders, the clip, and the card -- works
+    in one frame and none of them needs its own wrap handling. Returns a new
+    dict; the caller's fdata (and the coordinator's cache) is not mutated.
+
+    windField and windForecast carry radii only, no longitudes -- their centers
+    come from `points`, which IS normalized here -- so they pass through."""
+    if ref is None:
+        return fdata
+
+    def _seq(seq):
+        return [[unwrap_lng(x, ref), y] for x, y in seq] if seq else []
+
+    def _dicts(seq):
+        out = []
+        for p in seq or []:
+            q = dict(p)
+            if q.get("lng") is not None:
+                q["lng"] = unwrap_lng(q["lng"], ref)
+            out.append(q)
+        return out
+
+    out = dict(fdata)
+    out["cone"] = _seq(fdata.get("cone"))
+    out["fcstTrack"] = _seq(fdata.get("fcstTrack"))
+    out["pastTrack"] = _seq(fdata.get("pastTrack"))
+    out["points"] = _dicts(fdata.get("points"))
+    out["ww"] = [dict(w, coords=_seq(w.get("coords")))
+                 for w in (fdata.get("ww") or [])]
+    swath = []
+    for tier in (fdata.get("windSwath") or []):
+        t = dict(tier)
+        if tier.get("ring"):
+            t["ring"] = _seq(tier["ring"])
+        if tier.get("points"):
+            t["points"] = _dicts(tier["points"])
+        swath.append(t)
+    out["windSwath"] = swath
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Basemap (packed binary) reader — HURB v2/v3, matches tools/pack_basemap.py
 # (v3 adds a 4th POINT layer, populated places; a v2 file just has no places)
 # ---------------------------------------------------------------------------
@@ -124,39 +208,54 @@ class _Basemap:
 
     def clip(self, layer, bbox, pad):
         """Decode only the parts of `layer` whose stored bbox intersects the
-        padded view box. Returns a list of parts (each a list of [lng, lat])."""
+        padded view box. Returns a list of parts (each a list of [lng, lat]).
+
+        The basemap stores one world, in -180..180. A dateline-crossing storm's
+        frame is a continuous window that runs PAST that edge (see unwrap_lng),
+        so the query is repeated against each world copy the window touches and
+        the decoded coordinates are shifted into the frame. Without this the
+        coast on the far side of the dateline is simply missing from the map.
+        For any frame inside -180..180, _world_shifts is (0.0,) and this is the
+        original single pass."""
         q = self.quant
-        mnx = int((bbox[0] - pad) * q)
         mny = int((bbox[1] - pad) * q)
-        mxx = int((bbox[2] + pad) * q)
         mxy = int((bbox[3] + pad) * q)
+        x0, x1 = bbox[0] - pad, bbox[2] + pad
         out = []
-        for (a, b, c, d, poff, npts) in self.index.get(layer, []):
-            if a > mxx or c < mnx or b > mxy or d < mny:
-                continue
-            out.append(self._decode(poff, npts))
+        for s in _world_shifts(x0, x1):
+            mnx = int((x0 - s) * q)
+            mxx = int((x1 - s) * q)
+            for (a, b, c, d, poff, npts) in self.index.get(layer, []):
+                if a > mxx or c < mnx or b > mxy or d < mny:
+                    continue
+                part = self._decode(poff, npts)
+                out.append(part if not s else [[x + s, y] for x, y in part])
         return out
 
     def _points_in(self, records, bbox, pad):
+        """Point-layer counterpart to clip(), including the world-copy pass."""
         if not records:
             return []
         q = self.quant
-        mnx = int((bbox[0] - pad) * q)
         mny = int((bbox[1] - pad) * q)
-        mxx = int((bbox[2] + pad) * q)
         mxy = int((bbox[3] + pad) * q)
+        x0, x1 = bbox[0] - pad, bbox[2] + pad
         out = []
-        for (x, y, rank, pop, name) in records:
-            if x < mnx or x > mxx or y < mny or y > mxy:
-                continue
-            out.append({"name": name, "lng": x / q, "lat": y / q,
-                        "rank": rank, "pop": pop})
+        for s in _world_shifts(x0, x1):
+            mnx = int((x0 - s) * q)
+            mxx = int((x1 - s) * q)
+            for (x, y, rank, pop, name) in records:
+                if x < mnx or x > mxx or y < mny or y > mxy:
+                    continue
+                out.append({"name": name, "lng": x / q + s, "lat": y / q,
+                            "rank": rank, "pop": pop})
         return out
 
     def places_in(self, bbox, pad=0.0):
         """GeoNames density places inside the (padded) box, as dicts (rank = pop
-        bucket). Same quantized bbox compare as clip() — no antimeridian wrap,
-        matching the line layers. Empty on a v2 basemap."""
+        bucket). Same quantized bbox compare and same world-copy handling as
+        clip(), so points and lines can never disagree about what is in frame.
+        Empty on a v2 basemap."""
         return self._points_in(self.places, bbox, pad)
 
     def named_in(self, bbox, pad=0.0):
@@ -568,7 +667,11 @@ def trace_ww_on_coast(ww, coast, tol=WW_SNAP_TOL_DEG,
 def compute_bbox(cone, fcst, past):
     """Frame on the cone + tracks ONLY (home is not forced in) so a distant
     storm stays zoomed. Fitted to a 4:3 aspect with cos(lat) longitude
-    correction. Returns [minLng, minLat, maxLng, maxLat] or None."""
+    correction. Returns [minLng, minLat, maxLng, maxLat] or None.
+
+    Longitudes MUST already share one continuous frame (normalize_frame). This
+    takes a plain min/max, so mixed frames read as a storm ~360 degrees wide and
+    the aspect fit then throws latitude past the poles -- the dateline bug."""
     xs, ys = [], []
     for seq in (cone, fcst, past):
         for x, y in seq:
@@ -934,6 +1037,20 @@ def _exposure_timeline(points, wind_forecast, home_lat, home_lon):
 def assemble_payload(storm, fdata, home_lat, home_lon, units):
     """Build the final card payload from a selected storm + its parsed GIS."""
     basemap = load_basemap()
+
+    # Antimeridian: put the whole storm into ONE continuous longitude frame
+    # BEFORE anything measures or frames it (see unwrap_lng above). NHC can ship
+    # the cone and the tracks in different frames, and everything below --
+    # compute_bbox, the swath corridor builder, the clip, the card -- assumes
+    # one. `home` is unwrapped into the same frame so the PLANAR home-relative
+    # tests (point-in-ring for the wind report and the exposure timeline, the
+    # closest-approach solver) stay valid for a home near the dateline;
+    # haversine distances are correct either way.
+    frame_ref = storm.get("longitudeNumeric")
+    if frame_ref is not None:
+        fdata = normalize_frame(fdata, frame_ref)
+        home_lon = unwrap_lng(home_lon, frame_ref)
+
     cone = fdata.get("cone") or []
     fcst = fdata.get("fcstTrack") or []
     past = fdata.get("pastTrack") or []
@@ -975,12 +1092,18 @@ def assemble_payload(storm, fdata, home_lat, home_lon, units):
     # Region labels whose anchor falls anywhere in the BUFFERED viewBox (E6: the
     # card's zoom-aware label engine re-places labels at the current view, so
     # panning into the buffer must have anchors to reveal; the card filters to
-    # the visible frame per view). Longitude is also tested +/-360 so an
-    # antimeridian-wrapped window still matches anchors stored in -180..180.
-    labels = [r for r in REGION_LABELS
-              if view_box[1] <= r["lat"] <= view_box[3]
-              and any(view_box[0] <= lng <= view_box[2]
-                      for lng in (r["lng"], r["lng"] + 360, r["lng"] - 360))]
+    # the visible frame per view). Anchors are stored in -180..180, so each is
+    # unwrapped into the frame before the test AND emitted in-frame -- the card
+    # normalizes too, which is then a no-op, and server and card can't disagree.
+    # Copies, never the REGION_LABELS dicts themselves (module-level, shared).
+    view_cx = (view_box[0] + view_box[2]) / 2.0
+    labels = []
+    for r in REGION_LABELS:
+        if not view_box[1] <= r["lat"] <= view_box[3]:
+            continue
+        lng = unwrap_lng(r["lng"], view_cx)
+        if view_box[0] <= lng <= view_box[2]:
+            labels.append(dict(r, lng=round(lng, 4)))
 
     # City dots (E3): places inside the BUFFERED viewBox (they live in the
     # geographic hu-pan group, so panning reveals them like the coastline),

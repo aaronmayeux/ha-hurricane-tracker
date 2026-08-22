@@ -186,6 +186,21 @@ async def async_get_imagery(hass, coordinator, layer, bbox, storm_id):
         bbox = []
     if len(bbox) != 4:
         return {"ok": False, "reason": "no_bbox"}
+
+    # Antimeridian: the card's frame is a continuous longitude window that can
+    # legitimately run outside -180..180 (see geometry.unwrap_lng), and both the
+    # coverage test and the 3857 transform need real longitudes. Shift the whole
+    # window back by whole turns. A window that STILL straddles the seam after
+    # that cannot be one raster request from any of these services, so it reports
+    # honest 'no coverage' rather than asking for an extent off the end of the
+    # world -- which is what a dateline storm would otherwise send.
+    turns = math.floor(((bbox[0] + bbox[2]) / 2.0 + 180.0) / 360.0)
+    if turns:
+        bbox = [bbox[0] - turns * 360.0, bbox[1],
+                bbox[2] - turns * 360.0, bbox[3]]
+    if bbox[0] < -180.0 or bbox[2] > 180.0:
+        return {"ok": True, "layer": layer, "covered": False}
+
     if not _covered(layer, bbox):
         return {"ok": True, "layer": layer, "covered": False}
 
