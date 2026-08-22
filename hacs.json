@@ -1,6 +1,6 @@
 {
   "name": "Hurricane Tracker",
   "content_in_root": false,
-  "homeassistant": "2024.8.0",
+  "homeassistant": "2024.12.0",
   "render_readme": true
 }

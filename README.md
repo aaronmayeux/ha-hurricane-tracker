@@ -50,7 +50,7 @@ you automatically — no manual dashboard resource to add.
 
 ## Requirements
 
-- Home Assistant **2024.8.0** or newer.
+- Home Assistant **2024.12.0** or newer.
 - HACS installed (for the install path below).
 - A home location anywhere on Earth — coverage is global.
 

@@ -147,7 +147,14 @@ class HurricaneConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class HurricaneOptionsFlow(OptionsFlow):
-    """Edit settings after setup. `self.config_entry` is supplied by HA."""
+    """Edit settings after setup.
+
+    `self.config_entry` is set on the flow by Home Assistant itself, but only
+    from HA 2024.12.0 onward — which is why `hacs.json` floors there. Do not
+    assign it in an `__init__`: HA deprecated that in 2024.11 and raises on it
+    from 2025.12. If the floor ever has to drop below 2024.12, stash the entry
+    under a private name instead.
+    """
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
