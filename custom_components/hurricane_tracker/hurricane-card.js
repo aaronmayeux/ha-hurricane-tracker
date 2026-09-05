@@ -3614,6 +3614,13 @@ if (!customElements.get("hurricane-card")) {
     type: "hurricane-card",
     name: "Hurricane Tracker",
     description: "Storm-framed cone for hurricanes, typhoons & cyclones worldwide (NHC + GDACS).",
+    // Stays FALSE until the narrow-width pack bug is fixed. The picker preview
+    // box is ~280px; the map draws beautifully at that size but the storm-data
+    // text collapses to one word per line, because the pager shares its flex
+    // row and reserves width the text never gets back. PACK_MIN_W_BAR (340)
+    // gates the bar sharing a line with the timeline, but nothing gates the
+    // PAGER against the text. Fix that, then set this true -- a live cone in
+    // the card picker is worth having.
     preview: false,
   });
 }

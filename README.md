@@ -13,8 +13,13 @@ The integration polls the U.S. [National Hurricane Center](https://www.nhc.noaa.
 System) for every other basin. It parses the storm geometry, picks the storms
 that match your chosen scope, clips a bundled global coastline basemap to each
 storm, and hands the card a ready-to-draw payload over an authenticated
-websocket. The card is a single vanilla-JS file that the integration loads for
-you automatically — no manual dashboard resource to add.
+websocket. The card is a single vanilla-JS file that the integration registers
+for you automatically — there is no dashboard resource to add by hand.
+
+> **Two steps, not one.** Installing the integration creates the entities and
+> registers the card, but it does not put anything on your dashboard. The map is
+> the card — add it yourself once, from the card picker or with one line of YAML.
+> See [Adding the card](#adding-the-card).
 
 ## Features
 
@@ -87,6 +92,9 @@ add-repository screen pre-filled. Confirm it, click **Download**, and restart HA
    | **Units** | Miles/mph or kilometers/km-h. Defaults to your HA unit system. |
    | **When no storms are active** | Show a calm "all clear" state, or hide the card entirely. |
    | **Which storms to show** | Show only the storm threatening/closest to home, or all active systems (the card cycles through them). |
+
+4. Click **Submit**, then **add the card to a dashboard** — see below. Setting up
+   the integration alone will not draw a map.
 
 All of these are editable later via the integration's **Configure** button.
 

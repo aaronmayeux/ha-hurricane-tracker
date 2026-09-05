@@ -16,6 +16,9 @@
     },
     "abort": {
       "single_instance_allowed": "Hurricane Tracker is already set up."
+    },
+    "create_entry": {
+      "default": "Setup complete.\n\n**Next step: add the card.** The map is drawn by a Lovelace card — the entities this integration creates are for automations and templates, not for showing the storm.\n\nOn any dashboard, choose **Edit → Add card**, search for **Hurricane Tracker**, and add it. Or add a Manual card with `type: custom:hurricane-card`. No configuration is required."
     }
   },
   "options": {
